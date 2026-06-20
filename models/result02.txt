@@ -1,0 +1,330 @@
+maude tool: 'maude'
+ checking version: WARNING:
+
+ 'maude --version' returned unsupported version '3.2'
+ Please install one of the following versions of Maude: 2.7.1, 3.0, 3.1, 3.2.1, 3.2.2, 3.3, 3.3.1
+
+Detailed results from testing 'maude'
+ command: maude --version
+ stdin:   
+ stdout:  3.2
+
+ stderr:  
+ checking installation: [Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+OK.
+theory OIDC_ImplicitFlow begin
+
+// Function signature and definition of the equational theory E
+
+functions: checkjwt/2, fst/1, h/1, jwt/2, pair/2, pk/1, sign/2, snd/1,
+           true/0, verify/3
+equations:
+    checkjwt(jwt(payload, sk), pk(sk)) = payload,
+    fst(<x.1, x.2>) = x.1,
+    snd(<x.1, x.2>) = x.2,
+    verify(sign(x.1, x.2), x.1, pk(x.2)) = true
+
+
+
+
+
+
+
+
+
+rule (modulo E) Setup_IdP:
+   [ Fr( ~skIdP ) ]
+  --[ IdP_Setup_I( pk(~skIdP) ) ]->
+   [
+   !IdP_PrivKey_I( ~skIdP ), !IdP_PubKey_I( pk(~skIdP) ), Out( pk(~skIdP) )
+   ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) Setup_RP:
+   [ Fr( ~clientId ) ]
+  --[ RP_Setup_I( ~clientId ) ]->
+   [
+   !RP_ClientId_I( ~clientId ), !IdP_KnowsRP_I( ~clientId ),
+   Out( ~clientId )
+   ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) Setup_User:
+   [ Fr( ~userId ), Fr( ~password ) ]
+  --[ User_Setup_I( ~userId ) ]->
+   [
+   !User_Creds_I( ~userId, ~password ),
+   !IdP_KnowsUser_I( ~userId, ~password )
+   ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) RP_Send_ImplicitRequest:
+   [ Fr( ~state ), Fr( ~nonce ), !RP_ClientId_I( clientId ) ]
+  --[ RP_Initiated_I( clientId, ~state, ~nonce ) ]->
+   [
+   RP_Waiting_I( clientId, ~state, ~nonce ),
+   Out( <'implicit_request', clientId, ~state, ~nonce> )
+   ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) IdP_Issue_Token_Directly:
+   [
+   In( <'implicit_request', clientId, state, nonce> ),
+   !IdP_KnowsRP_I( clientId ), !IdP_KnowsUser_I( userId, password ),
+   !IdP_PrivKey_I( skIdP )
+   ]
+  --[
+  IdP_Issued_Token_I( userId, clientId, nonce ),
+  Secret_I( jwt(<userId, clientId, nonce>, skIdP) )
+  ]->
+   [
+   Out( <'implicit_response', jwt(<userId, clientId, nonce>, skIdP), state>
+   )
+   ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) RP_Receive_Token:
+   [
+   RP_Waiting_I( clientId, state, nonce ),
+   In( <'implicit_response', idToken, state> ), !IdP_PubKey_I( pkIdP )
+   ]
+  --[
+  Eq( checkjwt(idToken, pkIdP), <userId, clientId, nonce> ),
+  RP_Authenticated_I( userId, clientId, nonce ),
+  Commit_I( clientId, userId, <clientId, nonce> )
+  ]->
+   [ RP_Session_I( clientId, userId ) ]
+
+  /*
+  rule (modulo AC) RP_Receive_Token:
+     [
+     RP_Waiting_I( clientId, state, nonce ),
+     In( <'implicit_response', idToken, state> ), !IdP_PubKey_I( pkIdP )
+     ]
+    --[
+    Eq( z, <userId, clientId, nonce> ),
+    RP_Authenticated_I( userId, clientId, nonce ),
+    Commit_I( clientId, userId, <clientId, nonce> )
+    ]->
+     [ RP_Session_I( clientId, userId ) ]
+    variants (modulo AC)
+    1. idToken
+             = idToken.10
+       pkIdP = pkIdP.12
+       z     = checkjwt(idToken.10, pkIdP.12)
+    
+    2. idToken
+             = jwt(z.11, x.13)
+       pkIdP = pk(x.13)
+       z     = z.11
+  */
+
+restriction Equality:
+  "∀ x y #i. (Eq( x, y ) @ #i) ⇒ (x = y)"
+  // safety formula
+
+lemma implicit_executable:
+  exists-trace
+  "∃ userId clientId nonce #i.
+    RP_Authenticated_I( userId, clientId, nonce ) @ #i"
+/*
+guarded formula characterizing all satisfying traces:
+"∃ userId clientId nonce #i.
+  (RP_Authenticated_I( userId, clientId, nonce ) @ #i)"
+*/
+simplify
+solve( RP_Waiting_I( clientId, state, nonce ) ▶₀ #i )
+  case RP_Send_ImplicitRequest
+  solve( !IdP_PubKey_I( pk(x) ) ▶₂ #i )
+    case Setup_IdP
+    solve( !KU( jwt(<userId, ~clientId, ~nonce>, ~skIdP) ) @ #vk.3 )
+      case IdP_Issue_Token_Directly
+      solve( !KU( ~state ) @ #vk.4 )
+        case RP_Send_ImplicitRequest
+        solve( !KU( ~clientId ) @ #vk.8 )
+          case RP_Send_ImplicitRequest
+          solve( !KU( ~nonce ) @ #vk.11 )
+            case RP_Send_ImplicitRequest
+            SOLVED // trace found
+          qed
+        qed
+      qed
+    qed
+  qed
+qed
+
+lemma implicit_token_secrecy:
+  all-traces
+  "∀ token #i. (Secret_I( token ) @ #i) ⇒ (¬(∃ #j. K( token ) @ #j))"
+/*
+guarded formula characterizing all counter-examples:
+"∃ token #i. (Secret_I( token ) @ #i) ∧ ∃ #j. (K( token ) @ #j)"
+*/
+simplify
+solve( !IdP_KnowsRP_I( clientId ) ▶₁ #i )
+  case Setup_RP
+  solve( !IdP_KnowsUser_I( userId, password ) ▶₂ #i )
+    case Setup_User
+    solve( !IdP_PrivKey_I( skIdP ) ▶₃ #i )
+      case Setup_IdP
+      solve( !KU( ~clientId ) @ #vk.3 )
+        case RP_Send_ImplicitRequest
+        solve( !KU( jwt(<~userId, ~clientId, nonce>, ~skIdP) ) @ #vk.7 )
+          case IdP_Issue_Token_Directly
+          SOLVED // trace found
+        qed
+      qed
+    qed
+  qed
+qed
+
+lemma implicit_authentication:
+  all-traces
+  "∀ userId clientId nonce #i.
+    (RP_Authenticated_I( userId, clientId, nonce ) @ #i) ⇒
+    (∃ #j. (IdP_Issued_Token_I( userId, clientId, nonce ) @ #j) ∧ (#j < #i))"
+/*
+guarded formula characterizing all counter-examples:
+"∃ userId clientId nonce #i.
+  (RP_Authenticated_I( userId, clientId, nonce ) @ #i)
+ ∧
+  ∀ #j. (IdP_Issued_Token_I( userId, clientId, nonce ) @ #j) ⇒ ¬(#j < #i)"
+*/
+simplify
+solve( RP_Waiting_I( clientId, state, nonce ) ▶₀ #i )
+  case RP_Send_ImplicitRequest
+  solve( !IdP_PubKey_I( pk(x) ) ▶₂ #i )
+    case Setup_IdP
+    solve( !KU( jwt(<userId, ~clientId, ~nonce>, ~skIdP) ) @ #vk.3 )
+      case IdP_Issue_Token_Directly
+      by contradiction /* from formulas */
+    next
+      case c_jwt
+      by solve( !KU( ~skIdP ) @ #vk.6 )
+    qed
+  qed
+qed
+
+lemma implicit_no_replay:
+  all-traces
+  "∀ clientId userId data #i #j.
+    ((Commit_I( clientId, userId, data ) @ #i) ∧
+     (Commit_I( clientId, userId, data ) @ #j)) ⇒
+    (#i = #j)"
+/*
+guarded formula characterizing all counter-examples:
+"∃ clientId userId data #i #j.
+  (Commit_I( clientId, userId, data ) @ #i) ∧
+  (Commit_I( clientId, userId, data ) @ #j)
+ ∧
+  ¬(#i = #j)"
+*/
+simplify
+solve( (#i < #j)  ∥ (#j < #i) )
+  case case_1
+  solve( RP_Waiting_I( clientId, state, nonce ) ▶₀ #i )
+    case RP_Send_ImplicitRequest
+    solve( !IdP_PubKey_I( pk(x) ) ▶₂ #i )
+      case Setup_IdP
+      solve( RP_Waiting_I( ~clientId, state.1, ~nonce ) ▶₀ #j )
+        case RP_Send_ImplicitRequest
+        by contradiction /* cyclic */
+      qed
+    qed
+  qed
+next
+  case case_2
+  solve( RP_Waiting_I( clientId, state, nonce ) ▶₀ #i )
+    case RP_Send_ImplicitRequest
+    solve( !IdP_PubKey_I( pk(x) ) ▶₂ #i )
+      case Setup_IdP
+      solve( RP_Waiting_I( ~clientId, state.1, ~nonce ) ▶₀ #j )
+        case RP_Send_ImplicitRequest
+        by contradiction /* cyclic */
+      qed
+    qed
+  qed
+qed
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/*
+WARNING: the following wellformedness checks failed!
+
+Unbound variables
+=================
+
+  rule `RP_Receive_Token' has unbound variables: 
+    userId
+
+Message Derivation Checks
+=========================
+
+  The variables of the follwing rule(s) are not derivable from their premises, you may be performing unintended pattern matching.
+
+Rule RP_Receive_Token: 
+Failed to derive Variable(s): userId
+*/
+
+/*
+Generated from:
+Tamarin version 1.8.0
+Maude version 3.2 (unsuported)
+Git revision: f172d7f00b1485446a1e7a42dc14623c2189cc42, branch: master
+Compiled at: 2023-09-01 08:49:23.916032222 UTC
+*/
+
+end
+
+==============================================================================
+summary of summaries:
+
+analyzed: 02_implicit_flow.spthy
+
+  processing time: 0.53s
+  
+  WARNING: 2 wellformedness check failed!
+           The analysis results might be wrong!
+  
+  implicit_executable (exists-trace): verified (8 steps)
+  implicit_token_secrecy (all-traces): falsified - found trace (7 steps)
+  implicit_authentication (all-traces): verified (6 steps)
+  implicit_no_replay (all-traces): verified (10 steps)
+
+==============================================================================

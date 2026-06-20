@@ -1,0 +1,178 @@
+/*
+ * OpenID Connect - Implicit Flow
+ * ================================
+ * Reference: "Automatic Verification of Security of OpenID Connect
+ *             Protocol with ProVerif" (Lu et al., 2017)
+ *
+ * Key differences from Authorization Code Flow:
+ *   - IdP returns the ID Token DIRECTLY (no intermediate code)
+ *   - No back-channel token request exists
+ *   - RP cannot authenticate itself (no client_secret exchange)
+ *   - Token is exposed in the browser URL fragment
+ *
+ * This flow is inherently weaker because:
+ *   1. Token is visible in browser history and Referer headers
+ *   2. RP identity is not cryptographically verified by the IdP
+ *   3. A malicious redirect_uri causes token theft
+ *
+ * Expected results vs ProVerif paper:
+ *   - Secrecy     : FALSIFIED (token on URL fragment)
+ *   - Auth User->RP: FALSIFIED (no client_secret binding)
+ *   - Anti-Replay  : FALSIFIED (token can be replayed to another RP)
+ */
+
+theory OIDC_ImplicitFlow
+begin
+
+builtins: signing, hashing
+
+functions: jwt/2, checkjwt/2
+
+equations: checkjwt(jwt(payload, sk), pk(sk)) = payload
+
+/* ========================================================
+   SETUP RULES
+   ======================================================== */
+
+rule Setup_IdP:
+    [ Fr(~skIdP) ]
+    --[ IdP_Setup_I(pk(~skIdP)) ]->
+    [ !IdP_PrivKey_I(~skIdP)
+    , !IdP_PubKey_I(pk(~skIdP))
+    , Out(pk(~skIdP))
+    ]
+
+/*
+ * In Implicit Flow, RP only has a client_id (no client_secret).
+ * This is typical for JavaScript single-page applications (SPAs)
+ * that cannot safely store a secret.
+ */
+rule Setup_RP:
+    [ Fr(~clientId) ]
+    --[ RP_Setup_I(~clientId) ]->
+    [ !RP_ClientId_I(~clientId)
+    , !IdP_KnowsRP_I(~clientId)
+    , Out(~clientId)
+    ]
+
+rule Setup_User:
+    [ Fr(~userId), Fr(~password) ]
+    --[ User_Setup_I(~userId) ]->
+    [ !User_Creds_I(~userId, ~password)
+    , !IdP_KnowsUser_I(~userId, ~password)
+    ]
+
+/* ========================================================
+   PROTOCOL RULES
+   ======================================================== */
+
+/*
+ * STEP 1: RP sends Authorization Request with response_type=token.
+ * (contrast with Code Flow which uses response_type=code)
+ */
+rule RP_Send_ImplicitRequest:
+    [ Fr(~state)
+    , Fr(~nonce)
+    , !RP_ClientId_I(clientId)
+    ]
+    --[ RP_Initiated_I(clientId, ~state, ~nonce) ]->
+    [ RP_Waiting_I(clientId, ~state, ~nonce)
+    , Out(<'implicit_request', clientId, ~state, ~nonce>)
+    ]
+
+/*
+ * STEP 2: IdP authenticates user and issues the ID Token DIRECTLY.
+ *
+ * Critical weakness modeled here:
+ *   The token is returned in the URL fragment (#id_token=...).
+ *   In Dolev-Yao terms: the token goes Out and is fully public.
+ *   There is no back-channel; the adversary can observe it.
+ */
+rule IdP_Issue_Token_Directly:
+    [ In(<'implicit_request', clientId, state, nonce>)
+    , !IdP_KnowsRP_I(clientId)
+    , !IdP_KnowsUser_I(userId, password)
+    , !IdP_PrivKey_I(skIdP)
+    ]
+    --[ IdP_Issued_Token_I(userId, clientId, nonce)
+      , Secret_I(jwt(<userId, clientId, nonce>, skIdP))
+      ]->
+    [ Out(<'implicit_response', jwt(<userId, clientId, nonce>, skIdP), state>) ]
+
+/*
+ * STEP 3: RP receives and verifies the ID Token.
+ *
+ * Even though RP checks the JWT signature and nonce,
+ * the adversary may have already observed the token (Step 2 above).
+ * Furthermore, RP cannot prove to the IdP that it is the intended audience.
+ */
+rule RP_Receive_Token:
+    let payload = checkjwt(idToken, pkIdP)
+    in
+    [ RP_Waiting_I(clientId, state, nonce)
+    , In(<'implicit_response', idToken, state>)
+    , !IdP_PubKey_I(pkIdP)
+    ]
+    --[ Eq(payload, <userId, clientId, nonce>)
+      , RP_Authenticated_I(userId, clientId, nonce)
+      , Commit_I(clientId, userId, <clientId, nonce>)
+      ]->
+    [ RP_Session_I(clientId, userId) ]
+
+/* ========================================================
+   RESTRICTIONS
+   ======================================================== */
+
+restriction Equality:
+    "All x y #i. Eq(x,y) @ i ==> x = y"
+
+/* ========================================================
+   SECURITY LEMMAS
+   ======================================================== */
+
+/* LEMMA 0: Sanity check. Expected: VERIFIED */
+lemma implicit_executable:
+    exists-trace
+    "Ex userId clientId nonce #i.
+     RP_Authenticated_I(userId, clientId, nonce) @ i"
+
+/*
+ * LEMMA 1: Secrecy of ID Token in Implicit Flow
+ *
+ * Expected: FALSIFIED
+ * Attack trace: adversary reads the token from the URL fragment (Out in Step 2).
+ */
+lemma implicit_token_secrecy:
+    "All token #i.
+     Secret_I(token) @ i
+     ==> not(Ex #j. K(token) @ j)"
+
+/*
+ * LEMMA 2: Authentication (User -> RP)
+ *
+ * Expected: FALSIFIED (weaker than Code Flow)
+ * An adversary who captured a token can replay it to the RP
+ * because the RP cannot verify who sent the token request.
+ */
+lemma implicit_authentication:
+    "All userId clientId nonce #i.
+     RP_Authenticated_I(userId, clientId, nonce) @ i
+     ==>
+     Ex #j.
+     IdP_Issued_Token_I(userId, clientId, nonce) @ j
+     & j < i"
+
+/*
+ * LEMMA 3: Injective Agreement (Anti-Replay)
+ *
+ * Expected: FALSIFIED
+ * Attack trace: adversary captures the token and replays it to a different RP.
+ * The nonce is still valid from the IdP's perspective.
+ */
+lemma implicit_no_replay:
+    "All clientId userId data #i #j.
+     Commit_I(clientId, userId, data) @ i
+     & Commit_I(clientId, userId, data) @ j
+     ==> #i = #j"
+
+end

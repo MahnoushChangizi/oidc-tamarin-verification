@@ -1,0 +1,222 @@
+/*
+ * OpenID Connect - Authorization Code Flow WITH Client Authentication
+ * ====================================================================
+ * Reference: "Automatic Verification of Security of OpenID Connect
+ *             Protocol with ProVerif" (Lu et al., 2017)
+ *
+ * Key difference from standard Code Flow:
+ *   - RP owns a long-term asymmetric key pair (skRP / pk(skRP))
+ *   - When requesting a token, RP signs the request with skRP
+ *     producing a "client_assertion" (a signed JWT)
+ *   - IdP verifies this assertion before issuing the ID Token
+ *   - This cryptographically proves RP identity to the IdP
+ *
+ * This is the strongest OIDC variant and should satisfy:
+ *   - Authentication of User to RP   : VERIFIED
+ *   - Authentication of RP to IdP    : VERIFIED  (new vs. Code Flow)
+ *   - Injective Agreement            : VERIFIED
+ *   - Secrecy                        : depends on channel model
+ */
+
+theory OIDC_CodeFlow_ClientAuth
+begin
+
+builtins: signing, hashing
+
+functions: jwt/2, checkjwt/2
+
+equations: checkjwt(jwt(payload, sk), pk(sk)) = payload
+
+/* ========================================================
+   SETUP RULES
+   ======================================================== */
+
+rule Setup_IdP:
+    [ Fr(~skIdP) ]
+    --[ IdP_Setup_CA(pk(~skIdP)) ]->
+    [ !IdP_PrivKey_CA(~skIdP)
+    , !IdP_PubKey_CA(pk(~skIdP))
+    , Out(pk(~skIdP))
+    ]
+
+/*
+ * In this variant, RP has BOTH a client_secret AND an asymmetric key pair.
+ * The IdP stores pk(skRP) during registration.
+ * pk(skRP) is public; skRP must remain confidential.
+ */
+rule Setup_RP:
+    [ Fr(~clientId), Fr(~clientSecret), Fr(~skRP) ]
+    --[ RP_Setup_CA(~clientId, pk(~skRP)) ]->
+    [ !RP_FullCreds(~clientId, ~clientSecret, ~skRP)
+    , !IdP_KnowsRP_CA(~clientId, ~clientSecret, pk(~skRP))
+    , Out(~clientId)
+    , Out(pk(~skRP))
+    ]
+
+rule Setup_User:
+    [ Fr(~userId), Fr(~password) ]
+    --[ User_Setup_CA(~userId) ]->
+    [ !User_Creds_CA(~userId, ~password)
+    , !IdP_KnowsUser_CA(~userId, ~password)
+    ]
+
+/* ========================================================
+   PROTOCOL RULES
+   ======================================================== */
+
+/*
+ * STEP 1: RP sends Authorization Request (same as Code Flow).
+ */
+rule RP_Send_AuthRequest:
+    [ Fr(~state)
+    , Fr(~nonce)
+    , !RP_FullCreds(clientId, clientSecret, skRP)
+    ]
+    --[ RP_Initiated_CA(clientId, ~state, ~nonce) ]->
+    [ RP_WaitingForCode_CA(clientId, clientSecret, skRP, ~state, ~nonce)
+    , Out(<'auth_request_ca', clientId, ~state, ~nonce>)
+    ]
+
+/*
+ * STEP 2: IdP issues Authorization Code (same as Code Flow).
+ */
+rule IdP_Issue_Code:
+    [ In(<'auth_request_ca', clientId, state, nonce>)
+    , !IdP_KnowsRP_CA(clientId, clientSecret, pkRP)
+    , !IdP_KnowsUser_CA(userId, password)
+    , Fr(~code)
+    ]
+    --[ IdP_Issued_Code_CA(~code, clientId, userId, nonce) ]->
+    [ IdP_CodeIssued_CA(~code, clientId, userId, nonce, pkRP)
+    , Out(<'auth_code_ca', ~code, state>)
+    ]
+
+/*
+ * STEP 3: RP sends Token Request WITH a signed client_assertion.
+ *
+ * client_assertion = jwt(<clientId, 'token_endpoint', nonce>, skRP)
+ *
+ * This signed JWT proves to the IdP that only the legitimate RP
+ * (holder of skRP) could have created this request.
+ */
+rule RP_Request_Token:
+    [ RP_WaitingForCode_CA(clientId, clientSecret, skRP, state, nonce)
+    , In(<'auth_code_ca', code, state>)
+    ]
+    --[ RP_Got_Code_CA(code, clientId) ]->
+    [ RP_WaitingForToken_CA(clientId, skRP, nonce, code)
+    , Out(<'token_request_ca', code, clientId
+          , jwt(<clientId, 'token_endpoint', nonce>, skRP)>)
+    ]
+
+/*
+ * STEP 4: IdP verifies the client_assertion and issues the ID Token.
+ *
+ * checkjwt(assertion, pkRP) only succeeds if the assertion was
+ * signed by the private key corresponding to pkRP.
+ * If the attacker forged the assertion, this rule cannot fire.
+ */
+rule IdP_Issue_Token:
+    let assertion_payload = checkjwt(clientAssertion, pkRP)
+    in
+    [ In(<'token_request_ca', code, clientId, clientAssertion>)
+    , IdP_CodeIssued_CA(code, clientId, userId, nonce, pkRP)
+    , !IdP_PrivKey_CA(skIdP)
+    ]
+    --[ Eq(assertion_payload, <clientId, 'token_endpoint', nonce>)
+      , IdP_Authenticated_RP(clientId, nonce)
+      , IdP_Issued_Token_CA(userId, clientId, nonce)
+      , Secret_CA(jwt(<userId, clientId, nonce>, skIdP))
+      ]->
+    [ Out(<'token_response_ca', jwt(<userId, clientId, nonce>, skIdP)>) ]
+
+/*
+ * STEP 5: RP verifies the ID Token (same checks as Code Flow).
+ */
+rule RP_Verify_Token:
+    let payload = checkjwt(idToken, pkIdP)
+    in
+    [ RP_WaitingForToken_CA(clientId, skRP, nonce, code)
+    , In(<'token_response_ca', idToken>)
+    , !IdP_PubKey_CA(pkIdP)
+    ]
+    --[ Eq(payload, <userId, clientId, nonce>)
+      , RP_Authenticated_CA(userId, clientId, nonce)
+      , Commit_CA(clientId, userId, <clientId, nonce>)
+      ]->
+    [ RP_Session_CA(clientId, userId) ]
+
+/* ========================================================
+   RESTRICTIONS
+   ======================================================== */
+
+restriction Equality:
+    "All x y #i. Eq(x,y) @ i ==> x = y"
+
+/* ========================================================
+   SECURITY LEMMAS
+   ======================================================== */
+
+/* LEMMA 0: Sanity check. Expected: VERIFIED */
+lemma ca_executable:
+    exists-trace
+    "Ex userId clientId nonce #i.
+     RP_Authenticated_CA(userId, clientId, nonce) @ i"
+
+/*
+ * LEMMA 1: Secrecy of ID Token
+ *
+ * Expected: compare result with Code Flow (Lemma 1 of file 01).
+ * Client authentication should not weaken secrecy;
+ * the channel model determines whether secrecy holds.
+ */
+lemma ca_token_secrecy:
+    "All token #i.
+     Secret_CA(token) @ i
+     ==> not(Ex #j. K(token) @ j)"
+
+/*
+ * LEMMA 2: Authentication of User to RP
+ *
+ * Expected: VERIFIED
+ * Same guarantee as Code Flow, but now backed by stronger RP identity.
+ */
+lemma ca_rp_authentication:
+    "All userId clientId nonce #i.
+     RP_Authenticated_CA(userId, clientId, nonce) @ i
+     ==>
+     (Ex code #j.
+      IdP_Issued_Code_CA(code, clientId, userId, nonce) @ j
+      & j < i)"
+
+/*
+ * LEMMA 3: Injective Agreement (Anti-Replay)
+ *
+ * Expected: VERIFIED
+ */
+lemma ca_injective_agreement:
+    "All clientId userId data #i #j.
+     Commit_CA(clientId, userId, data) @ i
+     & Commit_CA(clientId, userId, data) @ j
+     ==> #i = #j"
+
+/*
+ * LEMMA 4: Authentication of RP to IdP
+ *
+ * This property does NOT exist in the standard Code Flow.
+ * Whenever the IdP issues a token for (clientId, nonce),
+ * the RP must have previously proved possession of skRP
+ * by sending a valid client_assertion.
+ *
+ * Expected: VERIFIED
+ * This is the main security gain of using client authentication.
+ */
+lemma idp_authenticates_rp:
+    "All userId clientId nonce #i.
+     IdP_Issued_Token_CA(userId, clientId, nonce) @ #i
+     ==>
+     Ex #j.
+     IdP_Authenticated_RP(clientId, nonce) @ #j
+     & #j = #i"
+
+end
