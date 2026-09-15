@@ -1,0 +1,166 @@
+/*
+ * OpenID Connect - Key Reference Model: INSECURE (non-compliant)
+ * ==============================================================
+ * Same as 06A but ONE change in RP_VerifyToken:
+ *
+ *   INSECURE variant: RP trusts the key EMBEDDED in the token
+ *   (the "jwk header" case from RFC 7515 §4.1). It verifies the
+ *   signature with pk_in_token instead of the registry key.
+ *
+ *   OIDC Core §2 says SHOULD NOT do this — but SHOULD NOT is not
+ *   MUST NOT, so a non-compliant implementation may do exactly
+ *   this. This is the (pk_attacker, content_mod, sign_attacker)
+ *   attack the professor described.
+ *
+ * Expected: key_substitution_resistance / iss_binding FALSIFIED.
+ * Tamarin should find: malicious IdP forges a token with its own
+ * key, embeds its own pk, and the RP accepts it.
+ */
+
+theory OIDC_KeyRef_Insecure
+begin
+
+builtins: signing, hashing
+
+/* ---- SETUP (identical to 06A) ---- */
+
+rule Setup_IdP:
+    [ Fr(~skIdP) ]
+    --[ Setup_IdP_Done($IdP) ]->
+    [ !IdP_SK($IdP, ~skIdP)
+    , !IdP_PK($IdP, pk(~skIdP))
+    , Out(pk(~skIdP))
+    ]
+
+rule Setup_RP:
+    [ Fr(~cid), Fr(~csec) ]
+    --[ Setup_RP_Done(~cid) ]->
+    [ !RP_Cred(~cid, ~csec, $IdP)
+    , !IdP_KnowsRP($IdP, ~cid, ~csec)
+    , Out(~cid)
+    ]
+
+rule Setup_User:
+    [ Fr(~uid), Fr(~pw) ]
+    --[ Setup_User_Done(~uid) ]->
+    [ !IdP_KnowsUser($IdP, ~uid, ~pw) ]
+
+/* ---- PROTOCOL (identical to 06A) ---- */
+
+rule RP_AuthRequest:
+    [ Fr(~state), Fr(~nonce)
+    , !RP_Cred(cid, csec, expectedIdP)
+    ]
+    --[ RP_Start(cid, ~state, ~nonce) ]->
+    [ RP_WaitCode(cid, csec, ~state, ~nonce, expectedIdP)
+    , Out(<'authreq', cid, ~state, ~nonce>)
+    ]
+
+rule IdP_IssueCode:
+    [ In(<'authreq', cid, state, nonce>)
+    , !IdP_KnowsRP($IdP, cid, csec)
+    , !IdP_KnowsUser($IdP, uid, pw)
+    , Fr(~code)
+    ]
+    --[ Code_Issued(~code, $IdP, cid, uid, nonce) ]->
+    [ IdP_CodeDB(~code, $IdP, cid, uid, nonce)
+    , Out(<'code', ~code, state>)
+    ]
+
+rule RP_TokenRequest:
+    [ RP_WaitCode(cid, csec, state, nonce, expectedIdP)
+    , In(<'code', code, state>)
+    ]
+    --[ RP_GotCode(code, cid) ]->
+    [ RP_WaitToken(cid, csec, nonce, code, expectedIdP)
+    , Out(<'tokenreq', code, cid, csec>)
+    ]
+
+rule IdP_IssueToken:
+    let content = <$IdP, uid, cid, nonce>
+        token   = < pk(skIdP), content, sign(content, skIdP) >
+    in
+    [ In(<'tokenreq', code, cid, csec>)
+    , IdP_CodeDB(code, $IdP, cid, uid, nonce)
+    , !IdP_KnowsRP($IdP, cid, csec)
+    , !IdP_SK($IdP, skIdP)
+    ]
+    --[ Token_Issued($IdP, uid, cid, nonce) ]->
+    [ Out(<'tokenresp', token>) ]
+
+/*
+ * *** THE VULNERABILITY ***
+ * INSECURE verification:
+ * RP verifies the signature with pk_in_token (embedded in token),
+ * NOT with the registry key. It also does not tie iss to the key.
+ *
+ * An attacker who embeds pk(skEvil) and signs with skEvil will
+ * pass verify(sig, content, pk_in_token) = true.
+ */
+rule RP_VerifyToken_Insecure:
+    let content = <iss, uid, cid2, nonce2>
+    in
+    [ RP_WaitToken(cid, csec, nonce, code, expectedIdP)
+    , In(<'tokenresp', < pk_in_token, content, sig >>)
+    , !IdP_PK(expectedIdP, pk_registry)   /* present but NOT used for verify */
+    ]
+    --[ Eq(verify(sig, content, pk_in_token), true)  /* embedded key! */
+      , Eq(cid2, cid)
+      , Eq(nonce2, nonce)
+      , RP_Auth(uid, cid, nonce, iss)   /* trusts iss from token */
+      , Commit(cid, uid, <cid, nonce, iss>)
+      ]->
+    [ RP_Session(cid, uid, iss) ]
+
+/* ---- ADVERSARY (identical to 06A) ---- */
+
+rule Compromised_RP:
+    [ !RP_Cred(cid, csec, expectedIdP) ]
+    --[ Compromised(cid) ]->
+    [ Out(<cid, csec>) ]
+
+rule Malicious_IdP:
+    [ Fr(~skEvil) ]
+    --[ Malicious_IdP($EvilIdP) ]->
+    [ !EvilIdP_SK($EvilIdP, ~skEvil)
+    , Out(pk(~skEvil))
+    ]
+
+rule Malicious_Forge_Token:
+    let content = <claimedIss, victimUid, cid, nonce>
+    in
+    [ !EvilIdP_SK($EvilIdP, skEvil)
+    , In(<claimedIss, victimUid, cid, nonce>)
+    ]
+    --[ Evil_Forged(claimedIss, victimUid, cid, nonce) ]->
+    [ Out(<'tokenresp',
+           < pk(skEvil), content, sign(content, skEvil) >>) ]
+
+/* ---- RESTRICTIONS ---- */
+
+restriction Eq:
+    "All x y #i. Eq(x,y) @ i ==> x = y"
+
+/* ---- LEMMAS (identical formulas to 06A) ---- */
+
+lemma executable:
+    exists-trace
+    "Ex uid cid nonce idp #i. RP_Auth(uid, cid, nonce, idp) @ i"
+
+lemma key_substitution_resistance:
+    "All uid cid nonce idp #i.
+     RP_Auth(uid, cid, nonce, idp) @ i
+     ==> (Ex #j. Token_Issued(idp, uid, cid, nonce) @ j & j < i)
+       | (Ex cid2 #k. Compromised(cid2) @ k)"
+
+lemma iss_binding:
+    "All uid cid nonce idp #i.
+     RP_Auth(uid, cid, nonce, idp) @ i
+     ==> Ex #j. Token_Issued(idp, uid, cid, nonce) @ j & j < i"
+
+lemma injective_agreement:
+    "All cid uid data #i #j.
+     Commit(cid, uid, data) @ i & Commit(cid, uid, data) @ j
+     ==> #i = #j"
+
+end

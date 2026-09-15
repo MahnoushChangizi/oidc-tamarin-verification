@@ -1,0 +1,193 @@
+/*
+ * OpenID Connect - Key Reference Model: SECURE (spec-compliant)
+ * =============================================================
+ * Answers Prof. Chevalier's question (email, OIDC Core spec):
+ *
+ *   Per OIDC Core §2: "ID Tokens SHOULD NOT use the jku, jwk,
+ *   x5u, x5c JWS header parameters. Instead, references to keys
+ *   are communicated in advance via Discovery and Registration."
+ *
+ *   Per §3.1.3.7 step 6: "The Client MUST use the keys provided
+ *   by the Issuer." step 2: "iss MUST exactly match."
+ *
+ * JWT is modelled the way the professor described:
+ *   token = < pk_in_token, content, sign(content, sk) >
+ *   attacker forgery = < pk_attacker, content_mod,
+ *                        sign(content_mod, sk_attacker) >
+ *
+ * SECURE variant (this file):
+ *   RP retrieves pk from its pre-registered registry (!IdP_PK)
+ *   and IGNORES pk_in_token. It verifies the signature with the
+ *   REGISTERED key, and checks iss == expectedIdP.
+ *
+ * Expected: iss_binding / auth VERIFIED (attack blocked).
+ */
+
+theory OIDC_KeyRef_Secure
+begin
+
+builtins: signing, hashing
+
+/* ---- SETUP ---- */
+
+rule Setup_IdP:
+    [ Fr(~skIdP) ]
+    --[ Setup_IdP_Done($IdP) ]->
+    [ !IdP_SK($IdP, ~skIdP)
+    , !IdP_PK($IdP, pk(~skIdP))     /* registry: iss -> pk */
+    , Out(pk(~skIdP))
+    ]
+
+rule Setup_RP:
+    [ Fr(~cid), Fr(~csec) ]
+    --[ Setup_RP_Done(~cid) ]->
+    [ !RP_Cred(~cid, ~csec, $IdP)   /* RP knows which IdP it trusts */
+    , !IdP_KnowsRP($IdP, ~cid, ~csec)
+    , Out(~cid)
+    ]
+
+rule Setup_User:
+    [ Fr(~uid), Fr(~pw) ]
+    --[ Setup_User_Done(~uid) ]->
+    [ !IdP_KnowsUser($IdP, ~uid, ~pw) ]
+
+/* ---- PROTOCOL ---- */
+
+rule RP_AuthRequest:
+    [ Fr(~state), Fr(~nonce)
+    , !RP_Cred(cid, csec, expectedIdP)
+    ]
+    --[ RP_Start(cid, ~state, ~nonce) ]->
+    [ RP_WaitCode(cid, csec, ~state, ~nonce, expectedIdP)
+    , Out(<'authreq', cid, ~state, ~nonce>)
+    ]
+
+rule IdP_IssueCode:
+    [ In(<'authreq', cid, state, nonce>)
+    , !IdP_KnowsRP($IdP, cid, csec)
+    , !IdP_KnowsUser($IdP, uid, pw)
+    , Fr(~code)
+    ]
+    --[ Code_Issued(~code, $IdP, cid, uid, nonce) ]->
+    [ IdP_CodeDB(~code, $IdP, cid, uid, nonce)
+    , Out(<'code', ~code, state>)
+    ]
+
+rule RP_TokenRequest:
+    [ RP_WaitCode(cid, csec, state, nonce, expectedIdP)
+    , In(<'code', code, state>)
+    ]
+    --[ RP_GotCode(code, cid) ]->
+    [ RP_WaitToken(cid, csec, nonce, code, expectedIdP)
+    , Out(<'tokenreq', code, cid, csec>)
+    ]
+
+/*
+ * Token structure (as professor described):
+ *   < pk(skIdP), content, sign(content, skIdP) >
+ * content = <iss, uid, cid, nonce>
+ * The embedded pk(skIdP) is the "jwk header" the RP will IGNORE.
+ */
+rule IdP_IssueToken:
+    let content = <$IdP, uid, cid, nonce>
+        token   = < pk(skIdP), content, sign(content, skIdP) >
+    in
+    [ In(<'tokenreq', code, cid, csec>)
+    , IdP_CodeDB(code, $IdP, cid, uid, nonce)
+    , !IdP_KnowsRP($IdP, cid, csec)
+    , !IdP_SK($IdP, skIdP)
+    ]
+    --[ Token_Issued($IdP, uid, cid, nonce) ]->
+    [ Out(<'tokenresp', token>) ]
+
+/*
+ * SECURE verification:
+ * RP takes pk from REGISTRY (!IdP_PK expectedIdP), NOT from token.
+ * verify(sig, content, pk_registry) must succeed.
+ * iss (fst content) must equal expectedIdP.
+ */
+rule RP_VerifyToken_Secure:
+    let content = <iss, uid, cid2, nonce2>
+    in
+    [ RP_WaitToken(cid, csec, nonce, code, expectedIdP)
+    , In(<'tokenresp', < pk_in_token, content, sig >>)
+    , !IdP_PK(expectedIdP, pk_registry)   /* key from registry */
+    ]
+    --[ Eq(verify(sig, content, pk_registry), true)  /* registry key! */
+      , Eq(iss, expectedIdP)
+      , Eq(cid2, cid)
+      , Eq(nonce2, nonce)
+      , RP_Auth(uid, cid, nonce, expectedIdP)
+      , Commit(cid, uid, <cid, nonce, expectedIdP>)
+      ]->
+    [ RP_Session(cid, uid, expectedIdP) ]
+
+/* ---- ADVERSARY ---- */
+
+rule Compromised_RP:
+    [ !RP_Cred(cid, csec, expectedIdP) ]
+    --[ Compromised(cid) ]->
+    [ Out(<cid, csec>) ]
+
+/*
+ * Malicious IdP: builds a token with its OWN key,
+ * claiming ANY iss and ANY victim uid.
+ * token = < pk(skEvil), <claimedIss, victimUid, cid, nonce>,
+ *           sign(<...>, skEvil) >
+ */
+rule Malicious_IdP:
+    [ Fr(~skEvil) ]
+    --[ Malicious_IdP($EvilIdP) ]->
+    [ !EvilIdP_SK($EvilIdP, ~skEvil)
+    , Out(pk(~skEvil))
+    ]
+
+rule Malicious_Forge_Token:
+    let content = <claimedIss, victimUid, cid, nonce>
+    in
+    [ !EvilIdP_SK($EvilIdP, skEvil)
+    , In(<claimedIss, victimUid, cid, nonce>)
+    ]
+    --[ Evil_Forged(claimedIss, victimUid, cid, nonce) ]->
+    [ Out(<'tokenresp',
+           < pk(skEvil), content, sign(content, skEvil) >>) ]
+
+/* ---- RESTRICTIONS ---- */
+
+restriction Eq:
+    "All x y #i. Eq(x,y) @ i ==> x = y"
+
+/* ---- LEMMAS ---- */
+
+lemma executable:
+    exists-trace
+    "Ex uid cid nonce idp #i. RP_Auth(uid, cid, nonce, idp) @ i"
+
+/*
+ * KEY-SUBSTITUTION RESISTANCE
+ * If RP authenticated user via idp, then idp (the honest IdP)
+ * really issued a token for that user.
+ * Expected: VERIFIED — because RP uses registry key, so a
+ * token forged with skEvil fails verify() against pk_registry.
+ */
+lemma key_substitution_resistance:
+    "All uid cid nonce idp #i.
+     RP_Auth(uid, cid, nonce, idp) @ i
+     ==> (Ex #j. Token_Issued(idp, uid, cid, nonce) @ j & j < i)
+       | (Ex cid2 #k. Compromised(cid2) @ k)"
+
+/*
+ * ISS BINDING (IdP Mix-Up prevention)
+ * Expected: VERIFIED
+ */
+lemma iss_binding:
+    "All uid cid nonce idp #i.
+     RP_Auth(uid, cid, nonce, idp) @ i
+     ==> Ex #j. Token_Issued(idp, uid, cid, nonce) @ j & j < i"
+
+lemma injective_agreement:
+    "All cid uid data #i #j.
+     Commit(cid, uid, data) @ i & Commit(cid, uid, data) @ j
+     ==> #i = #j"
+
+end

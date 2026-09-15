@@ -1,0 +1,214 @@
+/*
+ * OpenID Connect - Authorization Code Flow
+ * EDITED per Fries (2021): full JWT payload + redirect_uri validation
+ * ====================================================================
+ * Changes vs original Model 1:
+ *
+ *  [1] JWT payload extended:
+ *        BEFORE: jwt(<uid, cid, nonce>, skIdP)
+ *        AFTER:  jwt(<$IdP, uid, cid, nonce>, skIdP)
+ *      IdP identity ($IdP) is now the first field (iss).
+ *
+ *  [2] redirect_uri added to auth request:
+ *        RP sends redirect_uri in authreq.
+ *        IdP validates it against registered value.
+ *        (Eq restriction enforces exact match.)
+ *
+ *  [3] RP checks iss in token:
+ *        RP extracts fst(payload) and checks it equals
+ *        the IdP it registered with ($IdP in RP_Cred).
+ *
+ * New lemmas added:
+ *   iss_binding    — token comes from the expected IdP
+ *   redirect_binding — code only issued for registered URI
+ */
+
+theory OIDC_Fries_CodeFlow
+begin
+
+builtins: signing, hashing
+
+functions: jwt/2, checkjwt/2
+equations: checkjwt(jwt(payload, sk), pk(sk)) = payload
+
+/* ---- SETUP ---- */
+
+/* IdP now has a public name $IdP and a keypair */
+rule Setup_IdP:
+    [ Fr(~skIdP) ]
+    --[ Setup_IdP_Done($IdP) ]->
+    [ !IdP_SK($IdP, ~skIdP)
+    , !IdP_PK($IdP, pk(~skIdP))
+    , Out(pk(~skIdP))
+    ]
+
+/* RP registers: clientId, clientSecret, redirect_uri, expectedIdP */
+rule Setup_RP:
+    [ Fr(~cid), Fr(~csec) ]
+    --[ Setup_RP_Done(~cid) ]->
+    [ !RP_Cred(~cid, ~csec, $redirectUri, $IdP)
+    , !IdP_KnowsRP($IdP, ~cid, ~csec, $redirectUri)
+    , Out(~cid)
+    ]
+
+rule Setup_User:
+    [ Fr(~uid), Fr(~pw) ]
+    --[ Setup_User_Done(~uid) ]->
+    [ !IdP_KnowsUser($IdP, ~uid, ~pw) ]
+
+/* ---- PROTOCOL ---- */
+
+/* Step 1: RP sends auth request with redirect_uri */
+rule RP_AuthRequest:
+    [ Fr(~state), Fr(~nonce)
+    , !RP_Cred(cid, csec, redirectUri, expectedIdP)
+    ]
+    --[ RP_Start(cid, ~state, ~nonce) ]->
+    [ RP_WaitCode(cid, csec, ~state, ~nonce, redirectUri, expectedIdP)
+    , Out(<'authreq', cid, ~state, ~nonce, redirectUri>)
+    ]
+
+/*
+ * Step 2: IdP validates redirect_uri [Fries: missing check = code hijacking]
+ * Eq(redirectUri_req, redirectUri_reg) enforces exact match.
+ */
+rule IdP_IssueCode:
+    [ In(<'authreq', cid, state, nonce, redirectUri_req>)
+    , !IdP_KnowsRP($IdP, cid, csec, redirectUri_reg)
+    , !IdP_KnowsUser($IdP, uid, pw)
+    , Fr(~code)
+    ]
+    --[ Eq(redirectUri_req, redirectUri_reg)
+      , Code_Issued(~code, $IdP, cid, uid, nonce, redirectUri_req)
+      ]->
+    [ IdP_CodeDB(~code, $IdP, cid, uid, nonce, redirectUri_req)
+    , Out(<'code', ~code, state, redirectUri_req>)
+    ]
+
+/* Step 3: RP exchanges code for token */
+rule RP_TokenRequest:
+    [ RP_WaitCode(cid, csec, state, nonce, redirectUri, expectedIdP)
+    , In(<'code', code, state, redirectUri>)
+    ]
+    --[ RP_GotCode(code, cid) ]->
+    [ RP_WaitToken(cid, csec, nonce, code, redirectUri, expectedIdP)
+    , Out(<'tokenreq', code, cid, csec, redirectUri>)
+    ]
+
+/*
+ * Step 4: IdP issues token with iss field [Fries: missing iss = IdP Mix-Up]
+ * payload = ($IdP, uid, cid, nonce)  — iss is first element
+ */
+rule IdP_IssueToken:
+    [ In(<'tokenreq', code, cid, csec, redirectUri>)
+    , IdP_CodeDB(code, $IdP, cid, uid, nonce, redirectUri)
+    , !IdP_KnowsRP($IdP, cid, csec, redirectUri_reg)
+    , !IdP_SK($IdP, skIdP)
+    ]
+    --[ Token_Issued($IdP, uid, cid, nonce)
+      , Secret(jwt(<$IdP, uid, cid, nonce>, skIdP))
+      ]->
+    [ Out(<'tokenresp', jwt(<$IdP, uid, cid, nonce>, skIdP)>) ]
+
+/*
+ * Step 5: RP verifies iss + audience + nonce [Fries: missing iss = Mix-Up]
+ * fst(payload) = iss — must equal expectedIdP
+ */
+rule RP_VerifyToken:
+    let payload  = checkjwt(tok, pkIdP)
+        iss      = fst(payload)
+        uid      = fst(snd(payload))
+        cid2     = fst(snd(snd(payload)))
+        nonce2   = snd(snd(snd(payload)))
+    in
+    [ RP_WaitToken(cid, csec, nonce, code, redirectUri, expectedIdP)
+    , In(<'tokenresp', tok>)
+    , !IdP_PK(expectedIdP, pkIdP)
+    ]
+    --[ Eq(iss, expectedIdP)   /* Fries: iss binding check */
+      , Eq(cid2, cid)
+      , Eq(nonce2, nonce)
+      , RP_Auth(uid, cid, nonce, expectedIdP)
+      , Commit(cid, uid, <cid, nonce, expectedIdP>)
+      ]->
+    [ RP_Session(cid, uid, expectedIdP) ]
+
+/* ---- ADVERSARY ---- */
+
+rule Compromised_RP:
+    [ !RP_Cred(cid, csec, redirectUri, expectedIdP) ]
+    --[ Compromised(cid) ]->
+    [ Out(<cid, csec>) ]
+
+/* Malicious IdP: attacker can issue tokens but only signed with evil key */
+rule Malicious_IdP:
+    [ Fr(~skEvil) ]
+    --[ Malicious_IdP($EvilIdP) ]->
+    [ !EvilIdP_SK($EvilIdP, ~skEvil)
+    , Out(pk(~skEvil))
+    , Out($EvilIdP)
+    ]
+
+rule Malicious_IdP_IssueToken:
+    [ !EvilIdP_SK($EvilIdP, skEvil)
+    , In(<victimUid, cid, nonce>)
+    ]
+    --[ Evil_Token($EvilIdP, victimUid, cid, nonce) ]->
+    [ Out(jwt(<$EvilIdP, victimUid, cid, nonce>, skEvil)) ]
+
+/* ---- RESTRICTIONS ---- */
+
+restriction Eq:
+    "All x y #i. Eq(x,y) @ i ==> x = y"
+
+/* ---- LEMMAS ---- */
+
+lemma executable:
+    exists-trace
+    "Ex uid cid nonce idp #i. RP_Auth(uid, cid, nonce, idp) @ i"
+
+/* Lemma 1: Token Secrecy — still falsified (channel still insecure in model 1) */
+lemma token_secrecy:
+    "All t #i.
+     Secret(t) @ i
+     ==> not(Ex #j. K(t) @ j)
+       | (Ex cid #k. Compromised(cid) @ k)"
+
+/* Lemma 2: RP Authentication */
+lemma rp_auth:
+    "All uid cid nonce idp #i.
+     RP_Auth(uid, cid, nonce, idp) @ i
+     ==> (Ex code ruri #j.
+          Code_Issued(code, idp, cid, uid, nonce, ruri) @ j & j < i)
+       | (Ex cid2 #k. Compromised(cid2) @ k)"
+
+/* Lemma 3: Injective Agreement */
+lemma injective_agreement:
+    "All cid uid data #i #j.
+     Commit(cid, uid, data) @ i
+     & Commit(cid, uid, data) @ j
+     ==> #i = #j"
+
+/* Lemma 4: Code Single-Use */
+lemma code_single_use:
+    "All code idp cid uid nonce ruri #i #j.
+     Code_Issued(code, idp, cid, uid, nonce, ruri) @ i
+     & Code_Issued(code, idp, cid, uid, nonce, ruri) @ j
+     ==> #i = #j"
+
+/* Lemma 5 (NEW): ISS Binding — IdP Mix-Up prevention */
+lemma iss_binding:
+    "All uid cid nonce idp #i.
+     RP_Auth(uid, cid, nonce, idp) @ i
+     ==> Ex #j.
+         Token_Issued(idp, uid, cid, nonce) @ j
+         & j < i"
+
+/* Lemma 6 (NEW): Redirect URI Binding */
+lemma redirect_binding:
+    "All code idp cid uid nonce ruri1 ruri2 #i #j.
+     Code_Issued(code, idp, cid, uid, nonce, ruri1) @ i
+     & Code_Issued(code, idp, cid, uid, nonce, ruri2) @ j
+     ==> (#i = #j & ruri1 = ruri2)"
+
+end

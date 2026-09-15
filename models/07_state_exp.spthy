@@ -1,0 +1,235 @@
+/*
+ * OpenID Connect — Model 7: state (CSRF) + exp (expiry)
+ * ======================================================
+ * Adds the two mechanisms not yet modelled:
+ *
+ *  [state]  OIDC Core §3.1.2.1 — "RECOMMENDED. Opaque value used
+ *           to maintain state between the request and the callback.
+ *           Typically, CSRF mitigation is done by cryptographically
+ *           binding the value of this parameter with a browser cookie."
+ *
+ *           Model: RP generates Fr(~state), sends it in authreq.
+ *           The code response carries a state back. The RP MUST
+ *           check that the returned state equals the one it sent.
+ *           Without this check -> attacker can inject a code from
+ *           a DIFFERENT session (CSRF / session-fixation).
+ *
+ *  [exp]    OIDC Core §3.1.3.7 step 9 — "The current time MUST be
+ *           before the time represented by the exp Claim."
+ *
+ *           Tamarin has no real time. Standard encoding: model
+ *           expiry as an EVENT. The adversary may fire Expire(tok)
+ *           at any point. A restriction then forbids RP_Auth on a
+ *           token that has already expired.
+ *
+ * Two variants in this one file are NOT possible (Tamarin needs
+ * one theory per file), so this file is the SECURE version.
+ * Companion file 07B removes both checks.
+ *
+ * Expected (07 secure):
+ *   executable            verified
+ *   state_binding         verified   <- NEW
+ *   no_expired_accept     verified   <- NEW
+ *   injective_agreement   verified
+ */
+
+theory OIDC_State_Exp_Secure
+begin
+
+builtins: signing, hashing
+
+/* ---- SETUP ---- */
+
+rule Setup_IdP:
+    [ Fr(~skIdP) ]
+    --[ Setup_IdP_Done($IdP) ]->
+    [ !IdP_SK($IdP, ~skIdP)
+    , !IdP_PK($IdP, pk(~skIdP))
+    , Out(pk(~skIdP))
+    ]
+
+rule Setup_RP:
+    [ Fr(~cid), Fr(~csec) ]
+    --[ Setup_RP_Done(~cid) ]->
+    [ !RP_Cred(~cid, ~csec, $IdP)
+    , !IdP_KnowsRP($IdP, ~cid, ~csec)
+    , Out(~cid)
+    ]
+
+rule Setup_User:
+    [ Fr(~uid), Fr(~pw) ]
+    --[ Setup_User_Done(~uid) ]->
+    [ !IdP_KnowsUser($IdP, ~uid, ~pw) ]
+
+/* ---- PROTOCOL ---- */
+
+/*
+ * Step 1: RP generates BOTH state and nonce.
+ *   state -> CSRF protection (checked on the CODE response)
+ *   nonce -> replay protection (checked inside the TOKEN)
+ * They protect different things at different steps.
+ */
+rule RP_AuthRequest:
+    [ Fr(~state), Fr(~nonce), !RP_Cred(cid, csec, expectedIdP) ]
+    --[ RP_Start(cid, ~state, ~nonce) ]->
+    [ RP_WaitCode(cid, csec, ~state, ~nonce, expectedIdP)
+    , Out(<'authreq', cid, ~state, ~nonce>)
+    ]
+
+rule IdP_IssueCode:
+    [ In(<'authreq', cid, state, nonce>)
+    , !IdP_KnowsRP($IdP, cid, csec)
+    , !IdP_KnowsUser($IdP, uid, pw)
+    , Fr(~code)
+    ]
+    --[ Code_Issued(~code, $IdP, cid, uid, nonce, state) ]->
+    [ IdP_CodeDB(~code, $IdP, cid, uid, nonce)
+    , Out(<'code', ~code, state>)
+    ]
+
+/*
+ * *** STATE CHECK (CSRF protection) ***
+ * The state that comes back MUST equal the state we sent.
+ * Note the pattern: RP_WaitCode holds `state`, and the In()
+ * pattern uses the SAME variable `state`. Tamarin unification
+ * enforces the equality — an attacker cannot substitute a code
+ * issued for a different session.
+ */
+rule RP_TokenRequest:
+    [ RP_WaitCode(cid, csec, state, nonce, expectedIdP)
+    , In(<'code', code, state>)          /* state must match */
+    ]
+    --[ State_Checked(cid, state)
+      , RP_GotCode(code, cid, state)
+      ]->
+    [ RP_WaitToken(cid, csec, nonce, code, expectedIdP)
+    , Out(<'tokenreq', code, cid, csec>)
+    ]
+
+/*
+ * Token now carries an explicit expiry handle ~exp.
+ * ~exp is a fresh name that identifies THIS token's validity.
+ */
+rule IdP_IssueToken:
+    let content = <$IdP, uid, cid, nonce, ~exp>
+        token   = < pk(skIdP), content, sign(content, skIdP) >
+    in
+    [ In(<'tokenreq', code, cid, csec>)
+    , IdP_CodeDB(code, $IdP, cid, uid, nonce)
+    , !IdP_KnowsRP($IdP, cid, csec)
+    , !IdP_SK($IdP, skIdP)
+    , Fr(~exp)
+    ]
+    --[ Token_Issued($IdP, uid, cid, nonce, ~exp) ]->
+    [ Out(<'tokenresp', token>) ]
+
+/*
+ * The adversary (or the passage of time) may expire a token.
+ * This is the standard Tamarin encoding of time: an event,
+ * not a number.
+ */
+rule Expire_Token:
+    [ In(exp) ]
+    --[ Expired(exp) ]->
+    [ ]
+
+/*
+ * *** EXPIRY CHECK ***
+ * RP_Auth fires with the exp handle. A restriction below
+ * forbids accepting a token whose exp was already Expired().
+ */
+rule RP_VerifyToken:
+    let content = <iss, uid, cid2, nonce2, exp>
+    in
+    [ RP_WaitToken(cid, csec, nonce, code, expectedIdP)
+    , In(<'tokenresp', < pk_in_token, content, sig >>)
+    , !IdP_PK(expectedIdP, pk_registry)
+    ]
+    --[ Eq(verify(sig, content, pk_registry), true)   /* registry key */
+      , Eq(iss, expectedIdP)                          /* iss binding  */
+      , Eq(cid2, cid)                                 /* audience     */
+      , Eq(nonce2, nonce)                             /* replay       */
+      , NotExpired(exp)                               /* expiry check */
+      , RP_Auth(uid, cid, nonce, expectedIdP, exp)
+      , Commit(cid, uid, <cid, nonce, expectedIdP>)
+      ]->
+    [ RP_Session(cid, uid, expectedIdP) ]
+
+/* ---- ADVERSARY ---- */
+
+rule Compromised_RP:
+    [ !RP_Cred(cid, csec, expectedIdP) ]
+    --[ Compromised(cid) ]->
+    [ Out(<cid, csec>) ]
+
+rule Malicious_IdP:
+    [ Fr(~skEvil) ]
+    --[ Malicious_IdP($EvilIdP) ]->
+    [ !EvilIdP_SK($EvilIdP, ~skEvil), Out(pk(~skEvil)) ]
+
+rule Malicious_Forge_Token:
+    let content = <claimedIss, victimUid, cid, nonce, exp>
+    in
+    [ !EvilIdP_SK($EvilIdP, skEvil)
+    , In(<claimedIss, victimUid, cid, nonce, exp>)
+    ]
+    --[ Evil_Forged(claimedIss, victimUid, cid, nonce) ]->
+    [ Out(<'tokenresp',
+           < pk(skEvil), content, sign(content, skEvil) >>) ]
+
+/* ---- RESTRICTIONS ---- */
+
+restriction Eq:
+    "All x y #i. Eq(x,y) @ i ==> x = y"
+
+/*
+ * Expiry semantics: you cannot accept a token at time #i
+ * if it was expired at some earlier time #j.
+ */
+restriction ExpiryCheck:
+    "All exp #i. NotExpired(exp) @ i
+     ==> not(Ex #j. Expired(exp) @ j & j < i)"
+
+/* ---- LEMMAS ---- */
+
+lemma executable:
+    exists-trace
+    "Ex uid cid nonce idp exp #i.
+     RP_Auth(uid, cid, nonce, idp, exp) @ i"
+
+/*
+ * STATE BINDING (CSRF resistance)
+ * If the RP proceeded to the token request with some state,
+ * then that state was one IT generated in its own session.
+ * Expected: VERIFIED (state is Fr and matched by unification)
+ */
+lemma state_binding:
+    "All cid state #i.
+     State_Checked(cid, state) @ i
+     ==> Ex nonce #j. RP_Start(cid, state, nonce) @ j & j < i"
+
+/*
+ * NO EXPIRED TOKEN ACCEPTED
+ * If RP authenticated with exp handle, that exp was never
+ * expired before. Expected: VERIFIED (enforced by restriction)
+ */
+lemma no_expired_accept:
+    "All uid cid nonce idp exp #i.
+     RP_Auth(uid, cid, nonce, idp, exp) @ i
+     ==> not(Ex #j. Expired(exp) @ j & j < i)"
+
+/*
+ * KEY SUBSTITUTION (carried over from 06A — should still hold)
+ */
+lemma key_substitution_resistance:
+    "All uid cid nonce idp exp #i.
+     RP_Auth(uid, cid, nonce, idp, exp) @ i
+     ==> (Ex #j. Token_Issued(idp, uid, cid, nonce, exp) @ j & j < i)
+       | (Ex cid2 #k. Compromised(cid2) @ k)"
+
+lemma injective_agreement:
+    "All cid uid data #i #j.
+     Commit(cid, uid, data) @ i & Commit(cid, uid, data) @ j
+     ==> #i = #j"
+
+end

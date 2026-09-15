@@ -1,0 +1,394 @@
+maude tool: 'maude'
+ checking version: WARNING:
+
+ 'maude --version' returned unsupported version '3.2'
+ Please install one of the following versions of Maude: 2.7.1, 3.0, 3.1, 3.2.1, 3.2.2, 3.3, 3.3.1
+
+Detailed results from testing 'maude'
+ command: maude --version
+ stdin:   
+ stdout:  3.2
+
+ stderr:  
+ checking installation: [Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+OK.
+theory OIDC_AuthorizationCodeFlow_SecureChannel begin
+
+// Function signature and definition of the equational theory E
+
+functions: checkjwt/2, fst/1, h/1, jwt/2, pair/2, pk/1, sign/2, snd/1,
+           true/0, verify/3
+equations:
+    checkjwt(jwt(payload, sk), pk(sk)) = payload,
+    fst(<x.1, x.2>) = x.1,
+    snd(<x.1, x.2>) = x.2,
+    verify(sign(x.1, x.2), x.1, pk(x.2)) = true
+
+
+
+
+
+
+
+
+
+rule (modulo E) ChanOut_S:
+   [ Out_S( $A, $B, x ) ]
+  --[ ChanOut_S( $A, $B, x ) ]->
+   [ !Sec( $A, $B, x ) ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) ChanIn_S:
+   [ !Sec( $A, $B, x ) ] --[ ChanIn_S( $A, $B, x ) ]-> [ In_S( $A, $B, x ) ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) Setup_IdP:
+   [ Fr( ~skIdP ) ]
+  --[ Setup_IdP_Done( ) ]->
+   [ !IdP_SK( ~skIdP ), !IdP_PK( pk(~skIdP) ), Out( pk(~skIdP) ) ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) Setup_RP:
+   [ Fr( ~cid ), Fr( ~csec ) ]
+  --[ Setup_RP_Done( ~cid ) ]->
+   [ !RP_Cred( ~cid, ~csec ), !IdP_KnowsRP( ~cid, ~csec ), Out( ~cid ) ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) Setup_User:
+   [ Fr( ~uid ), Fr( ~pw ) ]
+  --[ Setup_User_Done( ~uid ) ]->
+   [ !IdP_KnowsUser( ~uid, ~pw ) ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) RP_AuthRequest:
+   [ Fr( ~state ), Fr( ~nonce ), !RP_Cred( cid, csec ) ]
+  --[ RP_Start( cid, ~state, ~nonce ) ]->
+   [
+   RP_WaitCode( cid, csec, ~state, ~nonce ),
+   Out( <'authreq', cid, ~state, ~nonce> )
+   ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) IdP_IssueCode:
+   [
+   In( <'authreq', cid, state, nonce> ), !IdP_KnowsRP( cid, csec ),
+   !IdP_KnowsUser( uid, pw ), Fr( ~code )
+   ]
+  --[ Code_Issued( ~code, cid, uid, nonce ) ]->
+   [ IdP_CodeDB( ~code, cid, uid, nonce ), Out( <'code', ~code, state> ) ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) RP_TokenRequest:
+   [ RP_WaitCode( cid, csec, state, nonce ), In( <'code', code, state> ) ]
+  --[ RP_GotCode( code, cid ) ]->
+   [
+   RP_WaitToken( cid, csec, nonce, code ),
+   Out( <'tokenreq', code, cid, csec> )
+   ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) IdP_IssueToken:
+   [
+   In( <'tokenreq', code, cid, csec> ), IdP_CodeDB( code, cid, uid, nonce ),
+   !IdP_KnowsRP( cid, csec ), !IdP_SK( skIdP )
+   ]
+  --[
+  Token_Issued( uid, cid, nonce ), Secret( jwt(<uid, cid, nonce>, skIdP) )
+  ]->
+   [ Out_S( $IdP, $RP, <'tokenresp', jwt(<uid, cid, nonce>, skIdP)> ) ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) RP_VerifyToken:
+   [
+   RP_WaitToken( cid, csec, nonce, code ),
+   In_S( $IdP, $RP, <'tokenresp', tok> ), !IdP_PK( pkIdP )
+   ]
+  --[
+  Eq( fst(snd(checkjwt(tok, pkIdP))), cid ),
+  Eq( snd(snd(checkjwt(tok, pkIdP))), nonce ),
+  RP_Auth( fst(checkjwt(tok, pkIdP)), cid, nonce ),
+  Commit( cid, fst(checkjwt(tok, pkIdP)), nonce )
+  ]->
+   [ RP_Session( cid, fst(checkjwt(tok, pkIdP)) ) ]
+
+  /*
+  rule (modulo AC) RP_VerifyToken:
+     [
+     RP_WaitToken( cid, csec, nonce, code ),
+     In_S( $IdP, $RP, <'tokenresp', tok> ), !IdP_PK( pkIdP )
+     ]
+    --[
+    Eq( z.1, cid ), Eq( z.2, nonce ), RP_Auth( z, cid, nonce ),
+    Commit( cid, z, nonce )
+    ]->
+     [ RP_Session( cid, z ) ]
+    variants (modulo AC)
+    1. pkIdP = pkIdP.14
+       tok   = tok.15
+       z     = fst(checkjwt(tok.15, pkIdP.14))
+       z.1   = fst(snd(checkjwt(tok.15, pkIdP.14)))
+       z.2   = snd(snd(checkjwt(tok.15, pkIdP.14)))
+    
+    2. pkIdP = pk(x.15)
+       tok   = jwt(x.16, x.15)
+       z     = fst(x.16)
+       z.1   = fst(snd(x.16))
+       z.2   = snd(snd(x.16))
+    
+    3. pkIdP = pk(x.19)
+       tok   = jwt(<z.16, x.21>, x.19)
+       z     = z.16
+       z.1   = fst(x.21)
+       z.2   = snd(x.21)
+    
+    4. pkIdP = pk(x.20)
+       tok   = jwt(<z.17, z.18, z.19>, x.20)
+       z     = z.17
+       z.1   = z.18
+       z.2   = z.19
+  */
+
+rule (modulo E) Compromised_RP:
+   [ !RP_Cred( cid, csec ) ]
+  --[ Compromised( cid ) ]->
+   [ Out( <cid, csec> ) ]
+
+  /* has exactly the trivial AC variant */
+
+restriction Eq:
+  "∀ x y #i. (Eq( x, y ) @ #i) ⇒ (x = y)"
+  // safety formula
+
+lemma executable:
+  exists-trace "∃ uid cid nonce #i. RP_Auth( uid, cid, nonce ) @ #i"
+/*
+guarded formula characterizing all satisfying traces:
+"∃ uid cid nonce #i. (RP_Auth( uid, cid, nonce ) @ #i)"
+*/
+simplify
+solve( RP_WaitToken( cid, csec, nonce, code ) ▶₀ #i )
+  case RP_TokenRequest
+  solve( In_S( $IdP, $RP, <'tokenresp', jwt(<uid, ~cid, ~nonce>, x)>
+         ) ▶₁ #i )
+    case ChanIn_S
+    solve( !IdP_PK( pk(~skIdP) ) ▶₂ #i )
+      case Setup_IdP
+      solve( !KU( ~state ) @ #vk.4 )
+        case RP_AuthRequest
+        solve( !KU( ~code.1 ) @ #vk.8 )
+          case IdP_IssueCode
+          solve( !KU( ~cid ) @ #vk.10 )
+            case Compromised_RP
+            solve( !KU( ~csec ) @ #vk.13 )
+              case Compromised_RP
+              solve( !KU( ~nonce ) @ #vk.17 )
+                case RP_AuthRequest
+                SOLVED // trace found
+              qed
+            qed
+          qed
+        qed
+      qed
+    qed
+  qed
+qed
+
+lemma token_secrecy:
+  all-traces
+  "∀ t #i.
+    (Secret( t ) @ #i) ⇒
+    ((¬(∃ #j. K( t ) @ #j)) ∨ (∃ cid #k. Compromised( cid ) @ #k))"
+/*
+guarded formula characterizing all counter-examples:
+"∃ t #i.
+  (Secret( t ) @ #i)
+ ∧
+  (∃ #j. (K( t ) @ #j)) ∧ (∀ cid #k. (Compromised( cid ) @ #k) ⇒ ⊥)"
+*/
+simplify
+solve( IdP_CodeDB( code, cid, uid, nonce ) ▶₁ #i )
+  case IdP_IssueCode
+  solve( !IdP_KnowsRP( ~cid, csec ) ▶₂ #i )
+    case Setup_RP
+    solve( !IdP_SK( skIdP ) ▶₃ #i )
+      case Setup_IdP
+      solve( !KU( ~csec ) @ #vk.8 )
+        case Compromised_RP
+        by contradiction /* from formulas */
+      next
+        case RP_TokenRequest
+        solve( !KU( jwt(<~uid, ~cid, nonce>, ~skIdP) ) @ #vk.9 )
+          case c_jwt
+          by solve( !KU( ~skIdP ) @ #vk.21 )
+        qed
+      qed
+    qed
+  qed
+qed
+
+lemma rp_auth:
+  all-traces
+  "∀ uid cid nonce #i.
+    (RP_Auth( uid, cid, nonce ) @ #i) ⇒
+    ((∃ code #j. (Code_Issued( code, cid, uid, nonce ) @ #j) ∧ (#j < #i)) ∨
+     (∃ cid2 #k. Compromised( cid2 ) @ #k))"
+/*
+guarded formula characterizing all counter-examples:
+"∃ uid cid nonce #i.
+  (RP_Auth( uid, cid, nonce ) @ #i)
+ ∧
+  (∀ code #j. (Code_Issued( code, cid, uid, nonce ) @ #j) ⇒ ¬(#j < #i)) ∧
+  (∀ cid2 #k. (Compromised( cid2 ) @ #k) ⇒ ⊥)"
+*/
+simplify
+solve( RP_WaitToken( cid, csec, nonce, code ) ▶₀ #i )
+  case RP_TokenRequest
+  solve( In_S( $IdP, $RP, <'tokenresp', jwt(<uid, ~cid, ~nonce>, x)>
+         ) ▶₁ #i )
+    case ChanIn_S
+    by contradiction /* from formulas */
+  qed
+qed
+
+lemma injective_agreement:
+  all-traces
+  "∀ cid uid nonce #i #j.
+    ((Commit( cid, uid, nonce ) @ #i) ∧ (Commit( cid, uid, nonce ) @ #j)) ⇒
+    (#i = #j)"
+/*
+guarded formula characterizing all counter-examples:
+"∃ cid uid nonce #i #j.
+  (Commit( cid, uid, nonce ) @ #i) ∧ (Commit( cid, uid, nonce ) @ #j)
+ ∧
+  ¬(#i = #j)"
+*/
+simplify
+solve( (#i < #j)  ∥ (#j < #i) )
+  case case_1
+  solve( RP_WaitToken( cid, csec, nonce, code ) ▶₀ #i )
+    case RP_TokenRequest
+    solve( In_S( $IdP, $RP, <'tokenresp', jwt(<uid, ~cid, ~nonce>, x)>
+           ) ▶₁ #i )
+      case ChanIn_S
+      solve( !IdP_PK( pk(~skIdP) ) ▶₂ #i )
+        case Setup_IdP
+        solve( RP_WaitToken( ~cid, csec.1, ~nonce, code.1 ) ▶₀ #j )
+          case RP_TokenRequest
+          by contradiction /* cyclic */
+        qed
+      qed
+    qed
+  qed
+next
+  case case_2
+  solve( RP_WaitToken( cid, csec, nonce, code ) ▶₀ #i )
+    case RP_TokenRequest
+    solve( In_S( $IdP, $RP, <'tokenresp', jwt(<uid, ~cid, ~nonce>, x)>
+           ) ▶₁ #i )
+      case ChanIn_S
+      solve( !IdP_PK( pk(~skIdP) ) ▶₂ #i )
+        case Setup_IdP
+        solve( RP_WaitToken( ~cid, csec.1, ~nonce, code.1 ) ▶₀ #j )
+          case RP_TokenRequest
+          by contradiction /* cyclic */
+        qed
+      qed
+    qed
+  qed
+qed
+
+lemma code_single_use:
+  all-traces
+  "∀ code cid uid nonce #i #j.
+    ((Code_Issued( code, cid, uid, nonce ) @ #i) ∧
+     (Code_Issued( code, cid, uid, nonce ) @ #j)) ⇒
+    (#i = #j)"
+/*
+guarded formula characterizing all counter-examples:
+"∃ code cid uid nonce #i #j.
+  (Code_Issued( code, cid, uid, nonce ) @ #i) ∧
+  (Code_Issued( code, cid, uid, nonce ) @ #j)
+ ∧
+  ¬(#i = #j)"
+*/
+simplify
+by contradiction /* from formulas */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/* All wellformedness checks were successful. */
+
+/*
+Generated from:
+Tamarin version 1.8.0
+Maude version 3.2 (unsuported)
+Git revision: f172d7f00b1485446a1e7a42dc14623c2189cc42, branch: master
+Compiled at: 2023-09-01 08:49:23.916032222 UTC
+*/
+
+end
+
+==============================================================================
+summary of summaries:
+
+analyzed: 04_authorization_code_flow_secure_channel.spthy
+
+  processing time: 1.79s
+  
+  executable (exists-trace): verified (10 steps)
+  token_secrecy (all-traces): verified (8 steps)
+  rp_auth (all-traces): verified (4 steps)
+  injective_agreement (all-traces): verified (12 steps)
+  code_single_use (all-traces): verified (2 steps)
+
+==============================================================================

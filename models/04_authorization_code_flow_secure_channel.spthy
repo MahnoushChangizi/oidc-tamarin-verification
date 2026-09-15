@@ -1,0 +1,220 @@
+theory OIDC_AuthorizationCodeFlow_SecureChannel
+begin
+
+/*
+ * OpenID Connect - Authorization Code Flow WITH Secure Channel
+ * ================================================================
+ * Reference: Lu et al., 2017 (ProVerif paper)
+ * Extension suggested by advisor: use Tamarin's built-in
+ * Secure Channel abstraction (see Tamarin Manual, Section 11,
+ * "Different Channel Models") instead of modelling TLS explicitly.
+ *
+ * WHY a Secure Channel instead of full TLS?
+ * ------------------------------------------
+ * Modelling real TLS (handshake, session keys, certificates) is a
+ * separate, large verification project on its own. What we actually
+ * need here is just the GUARANTEE that TLS provides at the
+ * application layer: messages cannot be read (confidential) and
+ * cannot be forged or modified (authentic) by the network attacker.
+ * Tamarin lets us assume this guarantee directly via built-in
+ * Secure Channel rules (Out_S / In_S), which is the standard way
+ * the Tamarin literature abstracts "this leg runs over TLS".
+ *
+ * WHAT CHANGED vs the original model
+ * ------------------------------------------
+ * Only ONE thing changes: the final token delivery from IdP to RP
+ * (Step 4: IdP_IssueToken -> RP_VerifyToken) now travels over a
+ * Secure Channel (Out_S/In_S) instead of the plain Dolev-Yao
+ * channel (Out/In). Every other message (auth request, redirect,
+ * code, token request) is UNCHANGED and still travels over the
+ * insecure channel, exactly like in the original model and like
+ * the ProVerif paper. This isolates the effect of "securing just
+ * the token response channel" so the comparison is meaningful.
+ */
+
+builtins: signing, hashing
+
+functions: jwt/2, checkjwt/2
+equations: checkjwt(jwt(payload, sk), pk(sk)) = payload
+
+/* ============================================================
+   SECURE CHANNEL RULES
+   (verbatim pattern from Tamarin Manual, Section 11)
+   ============================================================ */
+
+/*
+ * Out_S($A,$B,x): A sends x to B over a channel that is both
+ * confidential (attacker cannot read x) and authentic (attacker
+ * cannot inject a fake x claiming to be from A).
+ *
+ * !Sec($A,$B,x) is persistent => the adversary CAN still replay
+ * a previously-sent secure message (Tamarin's standard secure
+ * channel allows replay by default - this matches "TLS protects
+ * confidentiality/integrity, NOT freshness/replay" which is the
+ * realistic guarantee; replay protection in our protocol still
+ * has to come from the nonce, exactly as in the unsecured model).
+ */
+rule ChanOut_S:
+    [ Out_S($A, $B, x) ]
+    --[ ChanOut_S($A, $B, x) ]->
+    [ !Sec($A, $B, x) ]
+
+rule ChanIn_S:
+    [ !Sec($A, $B, x) ]
+    --[ ChanIn_S($A, $B, x) ]->
+    [ In_S($A, $B, x) ]
+
+/* ============================================================
+   SETUP
+   ============================================================ */
+
+rule Setup_IdP:
+    [ Fr(~skIdP) ]
+    --[ Setup_IdP_Done() ]->
+    [ !IdP_SK(~skIdP)
+    , !IdP_PK(pk(~skIdP))
+    , Out(pk(~skIdP))
+    ]
+
+rule Setup_RP:
+    [ Fr(~cid), Fr(~csec) ]
+    --[ Setup_RP_Done(~cid) ]->
+    [ !RP_Cred(~cid, ~csec)
+    , !IdP_KnowsRP(~cid, ~csec)
+    , Out(~cid)
+    ]
+
+rule Setup_User:
+    [ Fr(~uid), Fr(~pw) ]
+    --[ Setup_User_Done(~uid) ]->
+    [ !IdP_KnowsUser(~uid, ~pw) ]
+
+/* ============================================================
+   PROTOCOL
+   ============================================================ */
+
+/* Step 1: RP -> IdP, Authorization Request (UNCHANGED: insecure) */
+rule RP_AuthRequest:
+    [ Fr(~state), Fr(~nonce), !RP_Cred(cid, csec) ]
+    --[ RP_Start(cid, ~state, ~nonce) ]->
+    [ RP_WaitCode(cid, csec, ~state, ~nonce)
+    , Out(<'authreq', cid, ~state, ~nonce>)
+    ]
+
+/* Step 2: IdP -> RP, Authorization Code (UNCHANGED: insecure) */
+rule IdP_IssueCode:
+    [ In(<'authreq', cid, state, nonce>)
+    , !IdP_KnowsRP(cid, csec)
+    , !IdP_KnowsUser(uid, pw)
+    , Fr(~code)
+    ]
+    --[ Code_Issued(~code, cid, uid, nonce) ]->
+    [ IdP_CodeDB(~code, cid, uid, nonce)
+    , Out(<'code', ~code, state>)
+    ]
+
+/* Step 3: RP -> IdP, Token Request (UNCHANGED: insecure) */
+rule RP_TokenRequest:
+    [ RP_WaitCode(cid, csec, state, nonce)
+    , In(<'code', code, state>)
+    ]
+    --[ RP_GotCode(code, cid) ]->
+    [ RP_WaitToken(cid, csec, nonce, code)
+    , Out(<'tokenreq', code, cid, csec>)
+    ]
+
+/*
+ * Step 4: IdP -> RP, ID Token Response
+ * *** CHANGED: now sent over the Secure Channel (Out_S) ***
+ * This models "the token endpoint response travels over TLS":
+ * the attacker can neither read nor forge this specific message.
+ */
+rule IdP_IssueToken:
+    [ In(<'tokenreq', code, cid, csec>)
+    , IdP_CodeDB(code, cid, uid, nonce)
+    , !IdP_KnowsRP(cid, csec)
+    , !IdP_SK(skIdP)
+    ]
+    --[ Token_Issued(uid, cid, nonce)
+      , Secret(jwt(<uid, cid, nonce>, skIdP))
+      ]->
+    [ Out_S($IdP, $RP, <'tokenresp', jwt(<uid, cid, nonce>, skIdP)>) ]
+
+/*
+ * Step 5: RP verifies ID Token (signature + nonce + audience)
+ * *** CHANGED: now receives over the Secure Channel (In_S) ***
+ */
+rule RP_VerifyToken:
+    let payload = checkjwt(tok, pkIdP)
+        uid     = fst(payload)
+        cid2    = fst(snd(payload))
+        nonce2  = snd(snd(payload))
+    in
+    [ RP_WaitToken(cid, csec, nonce, code)
+    , In_S($IdP, $RP, <'tokenresp', tok>)
+    , !IdP_PK(pkIdP)
+    ]
+    --[ Eq(cid2, cid)
+      , Eq(nonce2, nonce)
+      , RP_Auth(uid, cid, nonce)
+      , Commit(cid, uid, nonce)
+      ]->
+    [ RP_Session(cid, uid) ]
+
+/* ============================================================
+   ADVERSARY
+   ============================================================ */
+
+rule Compromised_RP:
+    [ !RP_Cred(cid, csec) ]
+    --[ Compromised(cid) ]->
+    [ Out(<cid, csec>) ]
+
+/* ============================================================
+   RESTRICTIONS
+   ============================================================ */
+
+restriction Eq:
+    "All x y #i. Eq(x,y) @ i ==> x = y"
+
+/* ============================================================
+   LEMMAS
+   (identical formulas to the original model - only the channel
+   used by IdP_IssueToken/RP_VerifyToken changed, so we can do a
+   direct apples-to-apples comparison of verdicts)
+   ============================================================ */
+
+lemma executable:
+    exists-trace
+    "Ex uid cid nonce #i. RP_Auth(uid, cid, nonce) @ i"
+
+/*
+ * Lemma 1 - ID Token Secrecy
+ * Expected with Secure Channel: VERIFIED
+ * (this is the property we are FIXING relative to the original model)
+ */
+lemma token_secrecy:
+    "All t #i.
+     Secret(t) @ i
+     ==> not(Ex #j. K(t) @ j)
+       | (Ex cid #k. Compromised(cid) @ k)"
+
+lemma rp_auth:
+    "All uid cid nonce #i.
+     RP_Auth(uid, cid, nonce) @ i
+     ==> (Ex code #j. Code_Issued(code, cid, uid, nonce) @ j & j < i)
+       | (Ex cid2 #k. Compromised(cid2) @ k)"
+
+lemma injective_agreement:
+    "All cid uid nonce #i #j.
+     Commit(cid, uid, nonce) @ i
+     & Commit(cid, uid, nonce) @ j
+     ==> #i = #j"
+
+lemma code_single_use:
+    "All code cid uid nonce #i #j.
+     Code_Issued(code, cid, uid, nonce) @ i
+     & Code_Issued(code, cid, uid, nonce) @ j
+     ==> #i = #j"
+
+end

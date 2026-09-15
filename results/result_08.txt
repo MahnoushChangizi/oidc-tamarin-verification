@@ -1,0 +1,593 @@
+maude tool: 'maude'
+ checking version: WARNING:
+
+ 'maude --version' returned unsupported version '3.2'
+ Please install one of the following versions of Maude: 2.7.1, 3.0, 3.1, 3.2.1, 3.2.2, 3.3, 3.3.1
+
+Detailed results from testing 'maude'
+ command: maude --version
+ stdin:   
+ stdout:  3.2
+
+ stderr:  
+ checking installation: [Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+OK.
+theory OIDC_Complete_Secure begin
+
+// Function signature and definition of the equational theory E
+
+functions: fst/1, h/1, pair/2, pk/1, sign/2, snd/1, true/0, verify/3
+equations:
+    fst(<x.1, x.2>) = x.1,
+    snd(<x.1, x.2>) = x.2,
+    verify(sign(x.1, x.2), x.1, pk(x.2)) = true
+
+
+
+
+
+
+
+
+
+rule (modulo E) ChanOut_S:
+   [ Out_S( $A, $B, x ) ]
+  --[ ChanOut_S( $A, $B, x ) ]->
+   [ !Sec( $A, $B, x ) ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) ChanIn_S:
+   [ !Sec( $A, $B, x ) ] --[ ChanIn_S( $A, $B, x ) ]-> [ In_S( $A, $B, x ) ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) Setup_IdP:
+   [ Fr( ~skIdP ) ]
+  --[ Setup_IdP_Done( $IdP ) ]->
+   [ !IdP_SK( $IdP, ~skIdP ), !IdP_PK( $IdP, pk(~skIdP) ), Out( pk(~skIdP) )
+   ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) Setup_RP:
+   [ Fr( ~cid ), Fr( ~csec ) ]
+  --[ Setup_RP_Done( ~cid, $redirectUri ) ]->
+   [
+   !RP_Cred( ~cid, ~csec, $redirectUri, $IdP ),
+   !IdP_KnowsRP( $IdP, ~cid, ~csec, $redirectUri ), Out( ~cid )
+   ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) Setup_User:
+   [ Fr( ~uid ), Fr( ~pw ) ]
+  --[ Setup_User_Done( ~uid ) ]->
+   [ !IdP_KnowsUser( $IdP, ~uid, ~pw ) ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) RP_AuthRequest:
+   [
+   Fr( ~state ), Fr( ~nonce ),
+   !RP_Cred( cid, csec, redirectUri, expectedIdP )
+   ]
+  --[ RP_Start( cid, ~state, ~nonce, redirectUri, expectedIdP ) ]->
+   [
+   RP_WaitCode( cid, csec, ~state, ~nonce, redirectUri, expectedIdP ),
+   Out( <'authreq', cid, ~state, ~nonce, redirectUri> )
+   ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) IdP_IssueCode:
+   [
+   In( <'authreq', cid, state, nonce, redirectUri_req> ),
+   !IdP_KnowsRP( $IdP, cid, csec, redirectUri_reg ),
+   !IdP_KnowsUser( $IdP, uid, pw ), Fr( ~code )
+   ]
+  --[
+  Eq( redirectUri_req, redirectUri_reg ),
+  Code_Issued( ~code, $IdP, cid, uid, nonce, redirectUri_req )
+  ]->
+   [
+   IdP_CodeDB( ~code, $IdP, cid, uid, nonce, redirectUri_req ),
+   Out( <'code', ~code, state, redirectUri_req> )
+   ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) RP_TokenRequest:
+   [
+   RP_WaitCode( cid, csec, state, nonce, redirectUri, expectedIdP ),
+   In( <'code', code, state, redirectUri> )
+   ]
+  --[ State_Checked( cid, state ), RP_GotCode( code, cid, state ) ]->
+   [
+   RP_WaitToken( cid, csec, nonce, code, redirectUri, expectedIdP ),
+   Out( <'tokenreq', code, cid, csec, redirectUri> )
+   ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) IdP_IssueToken:
+   [
+   In( <'tokenreq', code, cid, csec, redirectUri> ),
+   IdP_CodeDB( code, $IdP, cid, uid, nonce, redirectUri ),
+   !IdP_KnowsRP( $IdP, cid, csec, redirectUri ), !IdP_SK( $IdP, skIdP ),
+   Fr( ~exp )
+   ]
+  --[
+  Token_Issued( $IdP, uid, cid, nonce, ~exp ),
+  Secret( <pk(skIdP), <$IdP, uid, cid, nonce, ~exp>, 
+           sign(<$IdP, uid, cid, nonce, ~exp>, skIdP)>
+  )
+  ]->
+   [
+   Out_S( $IdP, $RP,
+          <'tokenresp', pk(skIdP), <$IdP, uid, cid, nonce, ~exp>, 
+           sign(<$IdP, uid, cid, nonce, ~exp>, skIdP)>
+   )
+   ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) Expire_Token:
+   [ In( exp ) ] --[ Expired( exp ) ]-> [ ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) RP_VerifyToken:
+   [
+   RP_WaitToken( cid, csec, nonce, code, redirectUri, expectedIdP ),
+   In_S( $IdP, $RP,
+         <'tokenresp', pk_in_token, <iss, uid, cid2, nonce2, exp>, sig>
+   ),
+   !IdP_PK( expectedIdP, pk_registry )
+   ]
+  --[
+  Eq( verify(sig, <iss, uid, cid2, nonce2, exp>, pk_registry), true ),
+  Eq( iss, expectedIdP ), Eq( cid2, cid ), Eq( nonce2, nonce ),
+  NotExpired( exp ), RP_Auth( uid, cid, nonce, expectedIdP, exp ),
+  Commit( cid, uid, <cid, nonce, expectedIdP> )
+  ]->
+   [ RP_Session( cid, uid, expectedIdP ) ]
+
+  /*
+  rule (modulo AC) RP_VerifyToken:
+     [
+     RP_WaitToken( cid, csec, nonce, code, redirectUri, expectedIdP ),
+     In_S( $IdP, $RP,
+           <'tokenresp', pk_in_token, <iss, uid, cid2, nonce2, exp>, sig>
+     ),
+     !IdP_PK( expectedIdP, pk_registry )
+     ]
+    --[
+    Eq( z, true ), Eq( iss, expectedIdP ), Eq( cid2, cid ),
+    Eq( nonce2, nonce ), NotExpired( exp ),
+    RP_Auth( uid, cid, nonce, expectedIdP, exp ),
+    Commit( cid, uid, <cid, nonce, expectedIdP> )
+    ]->
+     [ RP_Session( cid, uid, expectedIdP ) ]
+    variants (modulo AC)
+    1. cid2  = cid2.20
+       exp   = exp.23
+       iss   = iss.25
+       nonce2
+             = nonce2.27
+       pk_registry
+             = pk_registry.29
+       sig   = sig.31
+       uid   = uid.32
+       z     = verify(sig.31, <iss.25, uid.32, cid2.20, nonce2.27, exp.23>,
+                      pk_registry.29)
+    
+    2. cid2  = cid2.31
+       exp   = exp.34
+       iss   = iss.36
+       nonce2
+             = nonce2.38
+       pk_registry
+             = pk(x.55)
+       sig   = sign(<iss.36, uid.43, cid2.31, nonce2.38, exp.34>, x.55)
+       uid   = uid.43
+       z     = true
+  */
+
+rule (modulo E) Compromised_RP:
+   [ !RP_Cred( cid, csec, redirectUri, expectedIdP ) ]
+  --[ Compromised( cid ) ]->
+   [ Out( <cid, csec> ) ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) Malicious_IdP:
+   [ Fr( ~skEvil ) ]
+  --[ Malicious_IdP( $EvilIdP ) ]->
+   [ !EvilIdP_SK( $EvilIdP, ~skEvil ), Out( pk(~skEvil) ), Out( $EvilIdP ) ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) Malicious_Forge_Token:
+   [
+   !EvilIdP_SK( $EvilIdP, skEvil ),
+   In( <claimedIss, victimUid, cid, nonce, exp> )
+   ]
+  --[ Evil_Forged( claimedIss, victimUid, cid, nonce ) ]->
+   [
+   Out( <'tokenresp', pk(skEvil), <claimedIss, victimUid, cid, nonce, exp>, 
+         sign(<claimedIss, victimUid, cid, nonce, exp>, skEvil)>
+   ),
+   Out_S( $EvilIdP, $RP,
+          <'tokenresp', pk(skEvil), <claimedIss, victimUid, cid, nonce, exp>, 
+           sign(<claimedIss, victimUid, cid, nonce, exp>, skEvil)>
+   )
+   ]
+
+  /* has exactly the trivial AC variant */
+
+restriction Eq:
+  "∀ x y #i. (Eq( x, y ) @ #i) ⇒ (x = y)"
+  // safety formula
+
+restriction ExpiryCheck:
+  "∀ exp #i.
+    (NotExpired( exp ) @ #i) ⇒ (¬(∃ #j. (Expired( exp ) @ #j) ∧ (#j < #i)))"
+  // safety formula
+
+lemma executable:
+  exists-trace
+  "∃ uid cid nonce idp exp #i. RP_Auth( uid, cid, nonce, idp, exp ) @ #i"
+/*
+guarded formula characterizing all satisfying traces:
+"∃ uid cid nonce idp exp #i. (RP_Auth( uid, cid, nonce, idp, exp ) @ #i)"
+*/
+simplify
+solve( RP_WaitToken( cid, csec, nonce, code, redirectUri, idp ) ▶₀ #i )
+  case RP_TokenRequest
+  solve( In_S( $IdP.1, $RP,
+               <'tokenresp', pk_in_token, <$IdP, uid, ~cid, ~nonce, exp>, 
+                sign(<$IdP, uid, ~cid, ~nonce, exp>, x)>
+         ) ▶₁ #i )
+    case ChanIn_S_case_1
+    solve( !IdP_PK( $IdP, pk(~skIdP) ) ▶₂ #i )
+      case Setup_IdP
+      solve( !KU( ~state ) @ #vk.5 )
+        case RP_AuthRequest
+        solve( !KU( ~code.1 ) @ #vk.15 )
+          case IdP_IssueCode
+          solve( !KU( ~cid ) @ #vk.17 )
+            case Compromised_RP
+            solve( !KU( ~csec ) @ #vk.18 )
+              case Compromised_RP
+              solve( !KU( ~nonce ) @ #vk.21 )
+                case RP_AuthRequest
+                SOLVED // trace found
+              qed
+            qed
+          qed
+        qed
+      qed
+    qed
+  qed
+qed
+
+lemma token_secrecy:
+  all-traces
+  "∀ t #i.
+    (Secret( t ) @ #i) ⇒
+    ((¬(∃ #j. K( t ) @ #j)) ∨ (∃ cid #k. Compromised( cid ) @ #k))"
+/*
+guarded formula characterizing all counter-examples:
+"∃ t #i.
+  (Secret( t ) @ #i)
+ ∧
+  (∃ #j. (K( t ) @ #j)) ∧ (∀ cid #k. (Compromised( cid ) @ #k) ⇒ ⊥)"
+*/
+simplify
+solve( IdP_CodeDB( code, $IdP, cid, uid, nonce, redirectUri ) ▶₁ #i )
+  case IdP_IssueCode
+  solve( !IdP_KnowsRP( $IdP, ~cid, csec, $redirectUri ) ▶₂ #i )
+    case Setup_RP
+    solve( !IdP_SK( $IdP, skIdP ) ▶₃ #i )
+      case Setup_IdP
+      by solve( !KU( ~exp ) @ #vk.23 )
+    qed
+  qed
+qed
+
+lemma rp_authentication:
+  all-traces
+  "∀ uid cid nonce idp exp #i.
+    (RP_Auth( uid, cid, nonce, idp, exp ) @ #i) ⇒
+    ((∃ code ruri #j.
+       (Code_Issued( code, idp, cid, uid, nonce, ruri ) @ #j) ∧ (#j < #i)) ∨
+     (∃ cid2 #k. Compromised( cid2 ) @ #k))"
+/*
+guarded formula characterizing all counter-examples:
+"∃ uid cid nonce idp exp #i.
+  (RP_Auth( uid, cid, nonce, idp, exp ) @ #i)
+ ∧
+  (∀ code ruri #j.
+    (Code_Issued( code, idp, cid, uid, nonce, ruri ) @ #j) ⇒ ¬(#j < #i)) ∧
+  (∀ cid2 #k. (Compromised( cid2 ) @ #k) ⇒ ⊥)"
+*/
+simplify
+solve( RP_WaitToken( cid, csec, nonce, code, redirectUri, idp ) ▶₀ #i )
+  case RP_TokenRequest
+  solve( In_S( $IdP.1, $RP,
+               <'tokenresp', pk_in_token, <$IdP, uid, ~cid, ~nonce, exp>, 
+                sign(<$IdP, uid, ~cid, ~nonce, exp>, x)>
+         ) ▶₁ #i )
+    case ChanIn_S_case_1
+    by contradiction /* from formulas */
+  next
+    case ChanIn_S_case_2
+    by solve( !IdP_PK( $IdP, pk(~skEvil) ) ▶₂ #i )
+  qed
+qed
+
+lemma iss_binding:
+  all-traces
+  "∀ uid cid nonce idp exp #i.
+    (RP_Auth( uid, cid, nonce, idp, exp ) @ #i) ⇒
+    (∃ #j. (Token_Issued( idp, uid, cid, nonce, exp ) @ #j) ∧ (#j < #i))"
+/*
+guarded formula characterizing all counter-examples:
+"∃ uid cid nonce idp exp #i.
+  (RP_Auth( uid, cid, nonce, idp, exp ) @ #i)
+ ∧
+  ∀ #j. (Token_Issued( idp, uid, cid, nonce, exp ) @ #j) ⇒ ¬(#j < #i)"
+*/
+simplify
+solve( RP_WaitToken( cid, csec, nonce, code, redirectUri, idp ) ▶₀ #i )
+  case RP_TokenRequest
+  solve( In_S( $IdP.1, $RP,
+               <'tokenresp', pk_in_token, <$IdP, uid, ~cid, ~nonce, exp>, 
+                sign(<$IdP, uid, ~cid, ~nonce, exp>, x)>
+         ) ▶₁ #i )
+    case ChanIn_S_case_1
+    by contradiction /* from formulas */
+  next
+    case ChanIn_S_case_2
+    by solve( !IdP_PK( $IdP, pk(~skEvil) ) ▶₂ #i )
+  qed
+qed
+
+lemma key_substitution_resistance:
+  all-traces
+  "∀ uid cid nonce idp exp #i.
+    (RP_Auth( uid, cid, nonce, idp, exp ) @ #i) ⇒
+    ((∃ #j. (Token_Issued( idp, uid, cid, nonce, exp ) @ #j) ∧ (#j < #i)) ∨
+     (∃ cid2 #k. Compromised( cid2 ) @ #k))"
+/*
+guarded formula characterizing all counter-examples:
+"∃ uid cid nonce idp exp #i.
+  (RP_Auth( uid, cid, nonce, idp, exp ) @ #i)
+ ∧
+  (∀ #j. (Token_Issued( idp, uid, cid, nonce, exp ) @ #j) ⇒ ¬(#j < #i)) ∧
+  (∀ cid2 #k. (Compromised( cid2 ) @ #k) ⇒ ⊥)"
+*/
+simplify
+solve( RP_WaitToken( cid, csec, nonce, code, redirectUri, idp ) ▶₀ #i )
+  case RP_TokenRequest
+  solve( In_S( $IdP.1, $RP,
+               <'tokenresp', pk_in_token, <$IdP, uid, ~cid, ~nonce, exp>, 
+                sign(<$IdP, uid, ~cid, ~nonce, exp>, x)>
+         ) ▶₁ #i )
+    case ChanIn_S_case_1
+    by contradiction /* from formulas */
+  next
+    case ChanIn_S_case_2
+    by solve( !IdP_PK( $IdP, pk(~skEvil) ) ▶₂ #i )
+  qed
+qed
+
+lemma redirect_binding:
+  all-traces
+  "∀ code idp cid uid nonce ruri #i.
+    (Code_Issued( code, idp, cid, uid, nonce, ruri ) @ #i) ⇒
+    (∃ #j. (Setup_RP_Done( cid, ruri ) @ #j) ∧ (#j < #i))"
+/*
+guarded formula characterizing all counter-examples:
+"∃ code idp cid uid nonce ruri #i.
+  (Code_Issued( code, idp, cid, uid, nonce, ruri ) @ #i)
+ ∧
+  ∀ #j. (Setup_RP_Done( cid, ruri ) @ #j) ⇒ ¬(#j < #i)"
+*/
+simplify
+solve( !IdP_KnowsRP( $IdP, cid, csec, ruri ) ▶₁ #i )
+  case Setup_RP
+  by contradiction /* from formulas */
+qed
+
+lemma state_binding:
+  all-traces
+  "∀ cid state #i.
+    (State_Checked( cid, state ) @ #i) ⇒
+    (∃ nonce ruri idp #j.
+      (RP_Start( cid, state, nonce, ruri, idp ) @ #j) ∧ (#j < #i))"
+/*
+guarded formula characterizing all counter-examples:
+"∃ cid state #i.
+  (State_Checked( cid, state ) @ #i)
+ ∧
+  ∀ nonce ruri idp #j.
+   (RP_Start( cid, state, nonce, ruri, idp ) @ #j) ⇒ ¬(#j < #i)"
+*/
+simplify
+solve( RP_WaitCode( cid, csec, state, nonce, redirectUri, expectedIdP
+       ) ▶₀ #i )
+  case RP_AuthRequest
+  by contradiction /* from formulas */
+qed
+
+lemma no_expired_accept:
+  all-traces
+  "∀ uid cid nonce idp exp #i.
+    (RP_Auth( uid, cid, nonce, idp, exp ) @ #i) ⇒
+    (¬(∃ #j. (Expired( exp ) @ #j) ∧ (#j < #i)))"
+/*
+guarded formula characterizing all counter-examples:
+"∃ uid cid nonce idp exp #i.
+  (RP_Auth( uid, cid, nonce, idp, exp ) @ #i)
+ ∧
+  ∃ #j. (Expired( exp ) @ #j) ∧ #j < #i"
+*/
+simplify
+by contradiction /* from formulas */
+
+lemma injective_agreement:
+  all-traces
+  "∀ cid uid data #i #j.
+    ((Commit( cid, uid, data ) @ #i) ∧ (Commit( cid, uid, data ) @ #j)) ⇒
+    (#i = #j)"
+/*
+guarded formula characterizing all counter-examples:
+"∃ cid uid data #i #j.
+  (Commit( cid, uid, data ) @ #i) ∧ (Commit( cid, uid, data ) @ #j)
+ ∧
+  ¬(#i = #j)"
+*/
+simplify
+solve( (#i < #j)  ∥ (#j < #i) )
+  case case_1
+  solve( RP_WaitToken( cid, csec, nonce, code, redirectUri, expectedIdP
+         ) ▶₀ #i )
+    case RP_TokenRequest
+    solve( In_S( $IdP.1, $RP,
+                 <'tokenresp', pk_in_token, <$IdP, uid, ~cid, ~nonce, exp>, 
+                  sign(<$IdP, uid, ~cid, ~nonce, exp>, x)>
+           ) ▶₁ #i )
+      case ChanIn_S_case_1
+      solve( !IdP_PK( $IdP, pk(~skIdP) ) ▶₂ #i )
+        case Setup_IdP
+        solve( RP_WaitToken( ~cid, csec.1, ~nonce, code.1, redirectUri.1, $IdP
+               ) ▶₀ #j )
+          case RP_TokenRequest
+          by contradiction /* cyclic */
+        qed
+      qed
+    next
+      case ChanIn_S_case_2
+      by solve( !IdP_PK( $IdP, pk(~skEvil) ) ▶₂ #i )
+    qed
+  qed
+next
+  case case_2
+  solve( RP_WaitToken( cid, csec, nonce, code, redirectUri, expectedIdP
+         ) ▶₀ #i )
+    case RP_TokenRequest
+    solve( In_S( $IdP.1, $RP,
+                 <'tokenresp', pk_in_token, <$IdP, uid, ~cid, ~nonce, exp>, 
+                  sign(<$IdP, uid, ~cid, ~nonce, exp>, x)>
+           ) ▶₁ #i )
+      case ChanIn_S_case_1
+      solve( !IdP_PK( $IdP, pk(~skIdP) ) ▶₂ #i )
+        case Setup_IdP
+        solve( RP_WaitToken( ~cid, csec.1, ~nonce, code.1, redirectUri.1, $IdP
+               ) ▶₀ #j )
+          case RP_TokenRequest
+          by contradiction /* cyclic */
+        qed
+      qed
+    next
+      case ChanIn_S_case_2
+      by solve( !IdP_PK( $IdP, pk(~skEvil) ) ▶₂ #i )
+    qed
+  qed
+qed
+
+lemma code_single_use:
+  all-traces
+  "∀ code idp cid uid nonce ruri #i #j.
+    ((Code_Issued( code, idp, cid, uid, nonce, ruri ) @ #i) ∧
+     (Code_Issued( code, idp, cid, uid, nonce, ruri ) @ #j)) ⇒
+    (#i = #j)"
+/*
+guarded formula characterizing all counter-examples:
+"∃ code idp cid uid nonce ruri #i #j.
+  (Code_Issued( code, idp, cid, uid, nonce, ruri ) @ #i) ∧
+  (Code_Issued( code, idp, cid, uid, nonce, ruri ) @ #j)
+ ∧
+  ¬(#i = #j)"
+*/
+simplify
+by contradiction /* from formulas */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/* All wellformedness checks were successful. */
+
+/*
+Generated from:
+Tamarin version 1.8.0
+Maude version 3.2 (unsuported)
+Git revision: f172d7f00b1485446a1e7a42dc14623c2189cc42, branch: master
+Compiled at: 2023-09-01 08:49:23.916032222 UTC
+*/
+
+end
+
+==============================================================================
+summary of summaries:
+
+analyzed: 08_complete_secure.spthy
+
+  processing time: 2.67s
+  
+  executable (exists-trace): verified (10 steps)
+  token_secrecy (all-traces): verified (5 steps)
+  rp_authentication (all-traces): verified (5 steps)
+  iss_binding (all-traces): verified (5 steps)
+  key_substitution_resistance (all-traces): verified (5 steps)
+  redirect_binding (all-traces): verified (3 steps)
+  state_binding (all-traces): verified (3 steps)
+  no_expired_accept (all-traces): verified (2 steps)
+  injective_agreement (all-traces): verified (14 steps)
+  code_single_use (all-traces): verified (2 steps)
+
+==============================================================================

@@ -1,0 +1,247 @@
+/*
+ * OpenID Connect - Authorization Code Flow
+ * =========================================
+ * Reference: "Automatic Verification of Security of OpenID Connect
+ *             Protocol with ProVerif" (Lu et al., 2017)
+ *
+ * Agents:
+ *   U   = User / Resource Owner
+ *   RP  = Relying Party (Client Application)
+ *   IdP = Identity Provider (Authorization Server)
+ *
+ * Security properties verified:
+ *   1. Secrecy of ID Token
+ *   2. Authentication of User to RP
+ *   3. Injective Agreement (Replay Attack prevention)
+ *   4. Single-use Authorization Code
+ */
+
+theory OIDC_AuthorizationCodeFlow
+begin
+
+builtins: signing, hashing
+
+/* ========================================================
+   FUNCTION DECLARATIONS
+   jwt(payload, sk)      -> signed token
+   checkjwt(tok, pk(sk)) -> returns payload if signature valid
+   ======================================================== */
+
+functions: jwt/2, checkjwt/2
+
+equations: checkjwt(jwt(payload, sk), pk(sk)) = payload
+
+/* ========================================================
+   SETUP RULES
+   ======================================================== */
+
+/* IdP generates a long-term signing key; public key is broadcast. */
+rule Setup_IdP:
+    [ Fr(~skIdP) ]
+    --[ IdP_Setup(pk(~skIdP)) ]->
+    [ !IdP_PrivKey(~skIdP)
+    , !IdP_PubKey(pk(~skIdP))
+    , Out(pk(~skIdP))
+    ]
+
+/*
+ * RP registers with the IdP.
+ * client_id is public; client_secret is confidential.
+ */
+rule Setup_RP:
+    [ Fr(~clientId), Fr(~clientSecret) ]
+    --[ RP_Setup(~clientId) ]->
+    [ !RP_Credentials(~clientId, ~clientSecret)
+    , !IdP_KnowsRP(~clientId, ~clientSecret)
+    , Out(~clientId)
+    ]
+
+/* User has a persistent identity registered with the IdP. */
+rule Setup_User:
+    [ Fr(~userId), Fr(~password) ]
+    --[ User_Setup(~userId) ]->
+    [ !User_Creds(~userId, ~password)
+    , !IdP_KnowsUser(~userId, ~password)
+    ]
+
+/* ========================================================
+   PROTOCOL RULES
+   ======================================================== */
+
+/*
+ * STEP 1: RP sends Authorization Request.
+ * ~state  -> CSRF protection token
+ * ~nonce  -> session binding (replay prevention)
+ */
+rule RP_Send_AuthRequest:
+    [ Fr(~state)
+    , Fr(~nonce)
+    , !RP_Credentials(clientId, clientSecret)
+    ]
+    --[ RP_Initiated(clientId, ~state, ~nonce) ]->
+    [ RP_WaitingForCode(clientId, clientSecret, ~state, ~nonce)
+    , Out(<'auth_request', clientId, ~state, ~nonce>)
+    ]
+
+/*
+ * STEP 2: IdP authenticates user and issues one-time Authorization Code.
+ * Code is returned to RP via browser redirect.
+ */
+rule IdP_Issue_Code:
+    [ In(<'auth_request', clientId, state, nonce>)
+    , !IdP_KnowsRP(clientId, clientSecret)
+    , !IdP_KnowsUser(userId, password)
+    , Fr(~code)
+    ]
+    --[ IdP_Issued_Code(~code, clientId, userId, nonce) ]->
+    [ IdP_CodeIssued(~code, clientId, userId, nonce)
+    , Out(<'auth_code', ~code, state>)
+    ]
+
+/*
+ * STEP 3: RP exchanges the code for a token (back-channel request).
+ * RP authenticates itself with client_secret.
+ */
+rule RP_Request_Token:
+    [ RP_WaitingForCode(clientId, clientSecret, state, nonce)
+    , In(<'auth_code', code, state>)
+    ]
+    --[ RP_Got_Code(code, clientId) ]->
+    [ RP_WaitingForToken(clientId, clientSecret, nonce, code)
+    , Out(<'token_request', code, clientId, clientSecret>)
+    ]
+
+/*
+ * STEP 4: IdP validates code + credentials, issues signed ID Token.
+ *
+ * ID Token payload = <userId, clientId, nonce>
+ *   userId   : authenticated subject
+ *   clientId : intended audience
+ *   nonce    : session binding value
+ */
+rule IdP_Issue_Token:
+    [ In(<'token_request', code, clientId, clientSecret>)
+    , IdP_CodeIssued(code, clientId, userId, nonce)
+    , !IdP_KnowsRP(clientId, clientSecret)
+    , !IdP_PrivKey(skIdP)
+    ]
+    --[ IdP_Issued_Token(userId, clientId, nonce)
+      , Secret(jwt(<userId, clientId, nonce>, skIdP))
+      ]->
+    [ Out(<'token_response', jwt(<userId, clientId, nonce>, skIdP)>) ]
+
+/*
+ * STEP 5: RP verifies the ID Token.
+ * Checks: (1) JWT signature via IdP public key
+ *         (2) nonce matches the one sent in Step 1
+ *         (3) audience (clientId) matches RP's own identifier
+ *
+ * checkjwt returns the payload only if signature is valid;
+ * otherwise this rule cannot fire (automatic authentication check).
+ */
+rule RP_Verify_Token:
+    let payload = checkjwt(idToken, pkIdP)
+    in
+    [ RP_WaitingForToken(clientId, clientSecret, nonce, code)
+    , In(<'token_response', idToken>)
+    , !IdP_PubKey(pkIdP)
+    ]
+    --[ Eq(payload, <userId, clientId, nonce>)
+      , RP_Authenticated(userId, clientId, nonce)
+      , Commit(clientId, userId, <clientId, nonce>)
+      ]->
+    [ RP_Session(clientId, userId) ]
+
+/* ========================================================
+   ADVERSARY RULES
+   ======================================================== */
+
+/*
+ * A compromised RP leaks its credentials to the adversary.
+ * Models a malicious or breached relying party.
+ */
+rule Compromised_RP:
+    [ !RP_Credentials(clientId, clientSecret) ]
+    --[ Compromised(clientId) ]->
+    [ Out(<clientId, clientSecret>) ]
+
+/* ========================================================
+   RESTRICTIONS
+   ======================================================== */
+
+restriction Equality:
+    "All x y #i. Eq(x,y) @ i ==> x = y"
+
+/* ========================================================
+   SECURITY LEMMAS
+   ======================================================== */
+
+/*
+ * LEMMA 0: Executability (Sanity Check)
+ *
+ * The protocol must complete at least once without contradiction.
+ * If FALSIFIED -> the model itself is broken (impossible to reach end state).
+ * Expected: VERIFIED
+ */
+lemma protocol_executable:
+    exists-trace
+    "Ex userId clientId nonce #i.
+     RP_Authenticated(userId, clientId, nonce) @ i"
+
+/*
+ * LEMMA 1: Secrecy of the ID Token
+ *
+ * The adversary must not learn any ID Token, unless an RP is compromised.
+ * Expected (matching ProVerif paper): FALSIFIED
+ * Reason: the token travels over the Dolev-Yao network without
+ *         an additional authenticated secure channel.
+ */
+lemma idtoken_secrecy:
+    "All token #i.
+     Secret(token) @ i
+     ==>
+       not(Ex #j. K(token) @ j)
+     | (Ex cId #k. Compromised(cId) @ k)"
+
+/*
+ * LEMMA 2: Authentication of User to RP
+ *
+ * Whenever RP successfully authenticates userId, the IdP must have
+ * previously issued a code for that exact (userId, clientId, nonce) triple.
+ * Expected (matching ProVerif paper): VERIFIED
+ */
+lemma rp_authentication:
+    "All userId clientId nonce #i.
+     RP_Authenticated(userId, clientId, nonce) @ i
+     ==>
+       (Ex code #j.
+        IdP_Issued_Code(code, clientId, userId, nonce) @ j
+        & j < i)
+     | (Ex cId #k. Compromised(cId) @ k)"
+
+/*
+ * LEMMA 3: Injective Agreement (Anti-Replay)
+ *
+ * No two distinct sessions may share the same (clientId, userId, data) triple.
+ * Enforced by the uniqueness of the nonce.
+ * Expected: VERIFIED
+ */
+lemma injective_agreement:
+    "All clientId userId data #i #j.
+     Commit(clientId, userId, data) @ i
+     & Commit(clientId, userId, data) @ j
+     ==> #i = #j"
+
+/*
+ * LEMMA 4: Authorization Code is Single-Use
+ *
+ * The same authorization code cannot be issued at two different time points.
+ * Expected: VERIFIED
+ */
+lemma code_single_use:
+    "All code clientId userId nonce #i #j.
+     IdP_Issued_Code(code, clientId, userId, nonce) @ i
+     & IdP_Issued_Code(code, clientId, userId, nonce) @ j
+     ==> #i = #j"
+
+end

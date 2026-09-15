@@ -1,0 +1,369 @@
+/*
+ * ============================================================
+ *  MODEL 9B — M3 DISABLED  (no redirect_uri validation)
+ * ============================================================
+ *  Identical to Model 8 except:
+ *
+ *   (1) Eq(redirectUri_req, redirectUri_reg) is REMOVED from
+ *       IdP_IssueCode. The IdP issues a code for ANY redirect
+ *       URI supplied in the request.
+ *
+ *   (2) redirect_binding is reformulated so that it actually
+ *       tests the mechanism (see the comment at the lemma).
+ *
+ *  Isolates mechanism M3 (OIDC Core Sec. 3.1.2.1).
+ *
+ *  EXPECTED: redirect_binding FALSIFIED.
+ * ============================================================
+ */
+
+theory OIDC_NoRedirectCheck
+begin
+
+builtins: signing, hashing
+
+/* ============================================================
+   M1 — SECURE CHANNEL  (Tamarin Manual, Sec. 11)
+   Models TLS on the Token Endpoint: the adversary can neither
+   read nor forge messages on this channel. Replay remains
+   possible (!Sec is persistent) — that is intentional and is
+   handled at the application layer by the nonce (M6/nonce).
+   ============================================================ */
+
+rule ChanOut_S:
+    [ Out_S($A, $B, x) ]
+    --[ ChanOut_S($A, $B, x) ]->
+    [ !Sec($A, $B, x) ]
+
+rule ChanIn_S:
+    [ !Sec($A, $B, x) ]
+    --[ ChanIn_S($A, $B, x) ]->
+    [ In_S($A, $B, x) ]
+
+/* ============================================================
+   SETUP
+   ============================================================ */
+
+/*
+ * The IdP has a public identity $IdP and a signing keypair.
+ * !IdP_PK is the REGISTRY: the authoritative mapping
+ *     issuer identity  ->  public key
+ * This is what M4 relies on.
+ */
+rule Setup_IdP:
+    [ Fr(~skIdP) ]
+    --[ Setup_IdP_Done($IdP) ]->
+    [ !IdP_SK($IdP, ~skIdP)
+    , !IdP_PK($IdP, pk(~skIdP))
+    , Out(pk(~skIdP))
+    ]
+
+/*
+ * RP registration records four things:
+ *   cid          client identifier
+ *   csec         client secret
+ *   redirectUri  the ONE callback URI (M3)
+ *   expectedIdP  which issuer this RP trusts (M2 + M4)
+ */
+rule Setup_RP:
+    [ Fr(~cid), Fr(~csec) ]
+    --[ Setup_RP_Done(~cid, $redirectUri) ]->
+    [ !RP_Cred(~cid, ~csec, $redirectUri, $IdP)
+    , !IdP_KnowsRP($IdP, ~cid, ~csec, $redirectUri)
+    , Out(~cid)
+    ]
+
+rule Setup_User:
+    [ Fr(~uid), Fr(~pw) ]
+    --[ Setup_User_Done(~uid) ]->
+    [ !IdP_KnowsUser($IdP, ~uid, ~pw) ]
+
+/* ============================================================
+   PROTOCOL
+   ============================================================ */
+
+/*
+ * Step 1 — Authorization Request
+ * RP generates two independent fresh values:
+ *   ~state  protects the CODE step   (CSRF, M5)
+ *   ~nonce  protects the TOKEN step  (replay)
+ * and sends its registered redirectUri (M3).
+ */
+rule RP_AuthRequest:
+    [ Fr(~state), Fr(~nonce)
+    , !RP_Cred(cid, csec, redirectUri, expectedIdP)
+    ]
+    --[ RP_Start(cid, ~state, ~nonce, redirectUri, expectedIdP) ]->
+    [ RP_WaitCode(cid, csec, ~state, ~nonce, redirectUri, expectedIdP)
+    , Out(<'authreq', cid, ~state, ~nonce, redirectUri>)
+    ]
+
+/*
+ * Step 2 — IdP issues the Authorization Code
+ *
+ * M3 ENFORCED HERE:
+ *   Eq(redirectUri_req, redirectUri_reg)
+ * The URI in the request must be exactly the registered one.
+ * Without this, the code can be diverted to an attacker host.
+ */
+rule IdP_IssueCode:
+    [ In(<'authreq', cid, state, nonce, redirectUri_req>)
+    , !IdP_KnowsRP($IdP, cid, csec, redirectUri_reg)
+    , !IdP_KnowsUser($IdP, uid, pw)
+    , Fr(~code)
+    ]
+    /* Eq(redirectUri_req, redirectUri_reg) REMOVED -- M3 disabled */
+    --[ Code_Issued(~code, $IdP, cid, uid, nonce, redirectUri_req)
+      ]->
+    [ IdP_CodeDB(~code, $IdP, cid, uid, nonce, redirectUri_req)
+    , Out(<'code', ~code, state, redirectUri_req>)
+    ]
+
+/*
+ * Step 3 — RP exchanges the code
+ *
+ * M5 ENFORCED HERE:
+ * The variable `state` appears BOTH in RP_WaitCode and in the
+ * In() pattern. Tamarin unification forces them to be equal,
+ * so a code minted for a different session is rejected.
+ */
+rule RP_TokenRequest:
+    [ RP_WaitCode(cid, csec, state, nonce, redirectUri, expectedIdP)
+    , In(<'code', code, state, redirectUri>)            /* M5 */
+    ]
+    --[ State_Checked(cid, state)
+      , RP_GotCode(code, cid, state)
+      ]->
+    [ RP_WaitToken(cid, csec, nonce, code, redirectUri, expectedIdP)
+    , Out(<'tokenreq', code, cid, csec, redirectUri>)
+    ]
+
+/*
+ * Step 4 — IdP issues the ID Token
+ *
+ * Token structure (as discussed with the supervisor):
+ *     < pk_in_token , content , sign(content, sk) >
+ * content = < iss, sub, aud, nonce, exp >
+ *
+ * The embedded pk_in_token models the JWS jwk/x5c header.
+ * A spec-compliant RP will IGNORE it (see M4 below).
+ *
+ * M1 ENFORCED HERE: delivered over Out_S, not Out.
+ */
+rule IdP_IssueToken:
+    let content = <$IdP, uid, cid, nonce, ~exp>
+        token   = < pk(skIdP), content, sign(content, skIdP) >
+    in
+    [ In(<'tokenreq', code, cid, csec, redirectUri>)
+    , IdP_CodeDB(code, $IdP, cid, uid, nonce, redirectUri)
+    , !IdP_KnowsRP($IdP, cid, csec, redirectUri)
+    , !IdP_SK($IdP, skIdP)
+    , Fr(~exp)
+    ]
+    --[ Token_Issued($IdP, uid, cid, nonce, ~exp)
+      , Secret(token)
+      ]->
+    [ Out_S($IdP, $RP, <'tokenresp', token>) ]          /* M1 */
+
+/*
+ * Time is not native to Tamarin. Expiry is modelled as an
+ * EVENT that the adversary (or the passage of time) may fire.
+ */
+rule Expire_Token:
+    [ In(exp) ]
+    --[ Expired(exp) ]->
+    [ ]
+
+/*
+ * Step 5 — RP validates the ID Token
+ *
+ * This single rule enforces four of the six mechanisms plus
+ * the two baseline claim checks:
+ *
+ *   M4  verify with pk_registry  (NOT pk_in_token)
+ *   M2  Eq(iss, expectedIdP)
+ *   M6  NotExpired(exp)
+ *   M1  arrives via In_S
+ *   +   Eq(cid2, cid)      audience   (Sec. 3.1.3.7 step 3)
+ *   +   Eq(nonce2, nonce)  replay     (Sec. 3.1.3.7 step 11)
+ *
+ * Note pk_in_token is bound but never used — this is exactly
+ * the spec-compliant behaviour of Sec. 2 / Sec. 3.1.3.7 step 6.
+ */
+rule RP_VerifyToken:
+    let content = <iss, uid, cid2, nonce2, exp>
+    in
+    [ RP_WaitToken(cid, csec, nonce, code, redirectUri, expectedIdP)
+    , In_S($IdP, $RP, <'tokenresp', < pk_in_token, content, sig >>)
+    , !IdP_PK(expectedIdP, pk_registry)
+    ]
+    --[ Eq(verify(sig, content, pk_registry), true)     /* M4 */
+      , Eq(iss, expectedIdP)                            /* M2 */
+      , Eq(cid2, cid)                                   /* aud */
+      , Eq(nonce2, nonce)                               /* nonce */
+      , NotExpired(exp)                                 /* M6 */
+      , RP_Auth(uid, cid, nonce, expectedIdP, exp)
+      , Commit(cid, uid, <cid, nonce, expectedIdP>)
+      ]->
+    [ RP_Session(cid, uid, expectedIdP) ]
+
+/* ============================================================
+   ADVERSARY
+   ============================================================ */
+
+rule Compromised_RP:
+    [ !RP_Cred(cid, csec, redirectUri, expectedIdP) ]
+    --[ Compromised(cid) ]->
+    [ Out(<cid, csec>) ]
+
+/* A malicious IdP with its own keypair. */
+rule Malicious_IdP:
+    [ Fr(~skEvil) ]
+    --[ Malicious_IdP($EvilIdP) ]->
+    [ !EvilIdP_SK($EvilIdP, ~skEvil)
+    , Out(pk(~skEvil))
+    , Out($EvilIdP)
+    ]
+
+/*
+ * The key-substitution forgery:
+ *   < pk(skEvil), content_mod, sign(content_mod, skEvil) >
+ * The attacker may claim ANY issuer and ANY victim identity.
+ * M4 is what defeats this.
+ */
+rule Malicious_Forge_Token:
+    let content = <claimedIss, victimUid, cid, nonce, exp>
+        token   = < pk(skEvil), content, sign(content, skEvil) >
+    in
+    [ !EvilIdP_SK($EvilIdP, skEvil)
+    , In(<claimedIss, victimUid, cid, nonce, exp>)
+    ]
+    --[ Evil_Forged(claimedIss, victimUid, cid, nonce) ]->
+    [ Out(<'tokenresp', token>)
+    /* Same adversary strength as Models 8 and 9A. */
+    , Out_S($EvilIdP, $RP, <'tokenresp', token>)
+    ]
+
+/* ============================================================
+   RESTRICTIONS
+   ============================================================ */
+
+restriction Eq:
+    "All x y #i. Eq(x,y) @ i ==> x = y"
+
+restriction ExpiryCheck:
+    "All exp #i. NotExpired(exp) @ i
+     ==> not(Ex #j. Expired(exp) @ j & j < i)"
+
+/* ============================================================
+   LEMMAS — the complete security claim
+   ============================================================ */
+
+/* Sanity: the protocol can run to completion. */
+lemma executable:
+    exists-trace
+    "Ex uid cid nonce idp exp #i.
+     RP_Auth(uid, cid, nonce, idp, exp) @ i"
+
+/*
+ * P1 — TOKEN SECRECY               (mechanism M1)
+ * The adversary never learns the ID Token.
+ */
+lemma token_secrecy:
+    "All t #i.
+     Secret(t) @ i
+     ==> not(Ex #j. K(t) @ j)
+       | (Ex cid #k. Compromised(cid) @ k)"
+
+/*
+ * P2 — AUTHENTICATION
+ * Any accepted login corresponds to a real code issuance
+ * by the expected IdP.
+ */
+lemma rp_authentication:
+    "All uid cid nonce idp exp #i.
+     RP_Auth(uid, cid, nonce, idp, exp) @ i
+     ==> (Ex code ruri #j.
+          Code_Issued(code, idp, cid, uid, nonce, ruri) @ j & j < i)
+       | (Ex cid2 #k. Compromised(cid2) @ k)"
+
+/*
+ * P3 — ISSUER BINDING              (mechanism M2)
+ * Prevents the IdP Mix-Up Attack.
+ */
+lemma iss_binding:
+    "All uid cid nonce idp exp #i.
+     RP_Auth(uid, cid, nonce, idp, exp) @ i
+     ==> Ex #j. Token_Issued(idp, uid, cid, nonce, exp) @ j & j < i"
+
+/*
+ * P4 — KEY SUBSTITUTION RESISTANCE (mechanism M4)
+ * A token forged with an attacker keypair is never accepted.
+ */
+lemma key_substitution_resistance:
+    "All uid cid nonce idp exp #i.
+     RP_Auth(uid, cid, nonce, idp, exp) @ i
+     ==> (Ex #j. Token_Issued(idp, uid, cid, nonce, exp) @ j & j < i)
+       | (Ex cid2 #k. Compromised(cid2) @ k)"
+
+/*
+ * P5 — REDIRECT URI BINDING        (mechanism M3)
+ * A code is bound to exactly one redirect URI.
+ */
+/*
+ * REDIRECT BINDING -- corrected formulation.
+ *
+ * The earlier version compared two Code_Issued events carrying the
+ * same fresh ~code. Since ~code is fresh, that can never happen, so
+ * the lemma held vacuously and tested nothing.
+ *
+ * This version asks the question that matters: whenever a code is
+ * issued for some redirect URI, did the legitimate RP actually
+ * request that URI?  If the IdP skips validation, the adversary can
+ * submit an authorisation request carrying a URI of its choosing and
+ * the code is issued for it -- with no matching RP_Start.
+ */
+lemma redirect_binding:
+    "All code idp cid uid nonce ruri #i.
+     Code_Issued(code, idp, cid, uid, nonce, ruri) @ i
+     ==> Ex #j.
+         Setup_RP_Done(cid, ruri) @ j & j < i"
+
+/*
+ * P6 — STATE BINDING               (mechanism M5)
+ * Prevents CSRF / session injection.
+ */
+lemma state_binding:
+    "All cid state #i.
+     State_Checked(cid, state) @ i
+     ==> Ex nonce ruri idp #j.
+         RP_Start(cid, state, nonce, ruri, idp) @ j & j < i"
+
+/*
+ * P7 — NO EXPIRED TOKEN ACCEPTED   (mechanism M6)
+ */
+lemma no_expired_accept:
+    "All uid cid nonce idp exp #i.
+     RP_Auth(uid, cid, nonce, idp, exp) @ i
+     ==> not(Ex #j. Expired(exp) @ j & j < i)"
+
+/*
+ * P8 — INJECTIVE AGREEMENT
+ * No replay of a complete session.
+ */
+lemma injective_agreement:
+    "All cid uid data #i #j.
+     Commit(cid, uid, data) @ i
+     & Commit(cid, uid, data) @ j
+     ==> #i = #j"
+
+/*
+ * P9 — CODE SINGLE USE
+ */
+lemma code_single_use:
+    "All code idp cid uid nonce ruri #i #j.
+     Code_Issued(code, idp, cid, uid, nonce, ruri) @ i
+     & Code_Issued(code, idp, cid, uid, nonce, ruri) @ j
+     ==> #i = #j"
+
+end

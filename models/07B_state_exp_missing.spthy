@@ -1,0 +1,190 @@
+/*
+ * OpenID Connect — Model 7B: state and exp checks REMOVED
+ * =======================================================
+ * Identical to Model 7 except TWO removals:
+ *
+ *  [1] STATE CHECK REMOVED
+ *      In Model 7:  In(<'code', code, state>)   <- same var 'state'
+ *      Here:        In(<'code', code, state_any>) <- fresh var
+ *      The RP accepts a code carrying ANY state value.
+ *      -> CSRF / session-injection becomes possible.
+ *
+ *  [2] EXPIRY CHECK REMOVED
+ *      In Model 7:  NotExpired(exp) action + restriction
+ *      Here:        no NotExpired action fired
+ *      -> An already-expired token is accepted.
+ *
+ * Everything else (registry key, iss binding, nonce, audience)
+ * is UNCHANGED, so the falsifications isolate exactly these two.
+ *
+ * Expected:
+ *   executable            verified
+ *   state_binding         FALSIFIED  <- attack
+ *   no_expired_accept     FALSIFIED  <- attack
+ */
+
+theory OIDC_State_Exp_Missing
+begin
+
+builtins: signing, hashing
+
+/* ---- SETUP (identical) ---- */
+
+rule Setup_IdP:
+    [ Fr(~skIdP) ]
+    --[ Setup_IdP_Done($IdP) ]->
+    [ !IdP_SK($IdP, ~skIdP)
+    , !IdP_PK($IdP, pk(~skIdP))
+    , Out(pk(~skIdP))
+    ]
+
+rule Setup_RP:
+    [ Fr(~cid), Fr(~csec) ]
+    --[ Setup_RP_Done(~cid) ]->
+    [ !RP_Cred(~cid, ~csec, $IdP)
+    , !IdP_KnowsRP($IdP, ~cid, ~csec)
+    , Out(~cid)
+    ]
+
+rule Setup_User:
+    [ Fr(~uid), Fr(~pw) ]
+    --[ Setup_User_Done(~uid) ]->
+    [ !IdP_KnowsUser($IdP, ~uid, ~pw) ]
+
+/* ---- PROTOCOL ---- */
+
+rule RP_AuthRequest:
+    [ Fr(~state), Fr(~nonce), !RP_Cred(cid, csec, expectedIdP) ]
+    --[ RP_Start(cid, ~state, ~nonce) ]->
+    [ RP_WaitCode(cid, csec, ~state, ~nonce, expectedIdP)
+    , Out(<'authreq', cid, ~state, ~nonce>)
+    ]
+
+rule IdP_IssueCode:
+    [ In(<'authreq', cid, state, nonce>)
+    , !IdP_KnowsRP($IdP, cid, csec)
+    , !IdP_KnowsUser($IdP, uid, pw)
+    , Fr(~code)
+    ]
+    --[ Code_Issued(~code, $IdP, cid, uid, nonce, state) ]->
+    [ IdP_CodeDB(~code, $IdP, cid, uid, nonce)
+    , Out(<'code', ~code, state>)
+    ]
+
+/*
+ * *** VULNERABILITY 1: NO STATE CHECK ***
+ * The incoming state is bound to a FRESH variable state_any,
+ * NOT to the state stored in RP_WaitCode. So any code with any
+ * state is accepted. This is the CSRF hole.
+ */
+rule RP_TokenRequest:
+    [ RP_WaitCode(cid, csec, state, nonce, expectedIdP)
+    , In(<'code', code, state_any>)     /* NOT matched to state! */
+    ]
+    --[ State_Checked(cid, state_any)   /* logs what it saw */
+      , RP_GotCode(code, cid, state_any)
+      ]->
+    [ RP_WaitToken(cid, csec, nonce, code, expectedIdP)
+    , Out(<'tokenreq', code, cid, csec>)
+    ]
+
+rule IdP_IssueToken:
+    let content = <$IdP, uid, cid, nonce, ~exp>
+        token   = < pk(skIdP), content, sign(content, skIdP) >
+    in
+    [ In(<'tokenreq', code, cid, csec>)
+    , IdP_CodeDB(code, $IdP, cid, uid, nonce)
+    , !IdP_KnowsRP($IdP, cid, csec)
+    , !IdP_SK($IdP, skIdP)
+    , Fr(~exp)
+    ]
+    --[ Token_Issued($IdP, uid, cid, nonce, ~exp) ]->
+    [ Out(<'tokenresp', token>) ]
+
+rule Expire_Token:
+    [ In(exp) ]
+    --[ Expired(exp) ]->
+    [ ]
+
+/*
+ * *** VULNERABILITY 2: NO EXPIRY CHECK ***
+ * NotExpired(exp) is NOT fired, so the ExpiryCheck restriction
+ * never applies. An expired token is happily accepted.
+ */
+rule RP_VerifyToken:
+    let content = <iss, uid, cid2, nonce2, exp>
+    in
+    [ RP_WaitToken(cid, csec, nonce, code, expectedIdP)
+    , In(<'tokenresp', < pk_in_token, content, sig >>)
+    , !IdP_PK(expectedIdP, pk_registry)
+    ]
+    --[ Eq(verify(sig, content, pk_registry), true)
+      , Eq(iss, expectedIdP)
+      , Eq(cid2, cid)
+      , Eq(nonce2, nonce)
+      /* NotExpired(exp) deliberately ABSENT */
+      , RP_Auth(uid, cid, nonce, expectedIdP, exp)
+      , Commit(cid, uid, <cid, nonce, expectedIdP>)
+      ]->
+    [ RP_Session(cid, uid, expectedIdP) ]
+
+/* ---- ADVERSARY (identical) ---- */
+
+rule Compromised_RP:
+    [ !RP_Cred(cid, csec, expectedIdP) ]
+    --[ Compromised(cid) ]->
+    [ Out(<cid, csec>) ]
+
+rule Malicious_IdP:
+    [ Fr(~skEvil) ]
+    --[ Malicious_IdP($EvilIdP) ]->
+    [ !EvilIdP_SK($EvilIdP, ~skEvil), Out(pk(~skEvil)) ]
+
+rule Malicious_Forge_Token:
+    let content = <claimedIss, victimUid, cid, nonce, exp>
+    in
+    [ !EvilIdP_SK($EvilIdP, skEvil)
+    , In(<claimedIss, victimUid, cid, nonce, exp>)
+    ]
+    --[ Evil_Forged(claimedIss, victimUid, cid, nonce) ]->
+    [ Out(<'tokenresp',
+           < pk(skEvil), content, sign(content, skEvil) >>) ]
+
+/* ---- RESTRICTIONS ---- */
+
+restriction Eq:
+    "All x y #i. Eq(x,y) @ i ==> x = y"
+
+restriction ExpiryCheck:
+    "All exp #i. NotExpired(exp) @ i
+     ==> not(Ex #j. Expired(exp) @ j & j < i)"
+
+/* ---- LEMMAS (identical formulas to Model 7) ---- */
+
+lemma executable:
+    exists-trace
+    "Ex uid cid nonce idp exp #i.
+     RP_Auth(uid, cid, nonce, idp, exp) @ i"
+
+lemma state_binding:
+    "All cid state #i.
+     State_Checked(cid, state) @ i
+     ==> Ex nonce #j. RP_Start(cid, state, nonce) @ j & j < i"
+
+lemma no_expired_accept:
+    "All uid cid nonce idp exp #i.
+     RP_Auth(uid, cid, nonce, idp, exp) @ i
+     ==> not(Ex #j. Expired(exp) @ j & j < i)"
+
+lemma key_substitution_resistance:
+    "All uid cid nonce idp exp #i.
+     RP_Auth(uid, cid, nonce, idp, exp) @ i
+     ==> (Ex #j. Token_Issued(idp, uid, cid, nonce, exp) @ j & j < i)
+       | (Ex cid2 #k. Compromised(cid2) @ k)"
+
+lemma injective_agreement:
+    "All cid uid data #i #j.
+     Commit(cid, uid, data) @ i & Commit(cid, uid, data) @ j
+     ==> #i = #j"
+
+end

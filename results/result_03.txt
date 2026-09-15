@@ -1,0 +1,440 @@
+maude tool: 'maude'
+ checking version: WARNING:
+
+ 'maude --version' returned unsupported version '3.2'
+ Please install one of the following versions of Maude: 2.7.1, 3.0, 3.1, 3.2.1, 3.2.2, 3.3, 3.3.1
+
+Detailed results from testing 'maude'
+ command: maude --version
+ stdin:   
+ stdout:  3.2
+
+ stderr:  
+ checking installation: [Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+[Saturating Sources] Step 1/5
+[Saturating Sources] Step 2/5
+OK.
+theory OIDC_CodeFlow_ClientAuth begin
+
+// Function signature and definition of the equational theory E
+
+functions: checkjwt/2, fst/1, h/1, jwt/2, pair/2, pk/1, sign/2, snd/1,
+           true/0, verify/3
+equations:
+    checkjwt(jwt(payload, sk), pk(sk)) = payload,
+    fst(<x.1, x.2>) = x.1,
+    snd(<x.1, x.2>) = x.2,
+    verify(sign(x.1, x.2), x.1, pk(x.2)) = true
+
+
+
+
+
+
+
+
+
+rule (modulo E) Setup_IdP:
+   [ Fr( ~skIdP ) ]
+  --[ IdP_Setup_CA( pk(~skIdP) ) ]->
+   [
+   !IdP_PrivKey_CA( ~skIdP ), !IdP_PubKey_CA( pk(~skIdP) ),
+   Out( pk(~skIdP) )
+   ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) Setup_RP:
+   [ Fr( ~clientId ), Fr( ~clientSecret ), Fr( ~skRP ) ]
+  --[ RP_Setup_CA( ~clientId, pk(~skRP) ) ]->
+   [
+   !RP_FullCreds( ~clientId, ~clientSecret, ~skRP ),
+   !IdP_KnowsRP_CA( ~clientId, ~clientSecret, pk(~skRP) ), Out( ~clientId ),
+   Out( pk(~skRP) )
+   ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) Setup_User:
+   [ Fr( ~userId ), Fr( ~password ) ]
+  --[ User_Setup_CA( ~userId ) ]->
+   [
+   !User_Creds_CA( ~userId, ~password ),
+   !IdP_KnowsUser_CA( ~userId, ~password )
+   ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) RP_Send_AuthRequest:
+   [
+   Fr( ~state ), Fr( ~nonce ), !RP_FullCreds( clientId, clientSecret, skRP )
+   ]
+  --[ RP_Initiated_CA( clientId, ~state, ~nonce ) ]->
+   [
+   RP_WaitingForCode_CA( clientId, clientSecret, skRP, ~state, ~nonce ),
+   Out( <'auth_request_ca', clientId, ~state, ~nonce> )
+   ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) IdP_Issue_Code:
+   [
+   In( <'auth_request_ca', clientId, state, nonce> ),
+   !IdP_KnowsRP_CA( clientId, clientSecret, pkRP ),
+   !IdP_KnowsUser_CA( userId, password ), Fr( ~code )
+   ]
+  --[ IdP_Issued_Code_CA( ~code, clientId, userId, nonce ) ]->
+   [
+   IdP_CodeIssued_CA( ~code, clientId, userId, nonce, pkRP ),
+   Out( <'auth_code_ca', ~code, state> )
+   ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) RP_Request_Token:
+   [
+   RP_WaitingForCode_CA( clientId, clientSecret, skRP, state, nonce ),
+   In( <'auth_code_ca', code, state> )
+   ]
+  --[ RP_Got_Code_CA( code, clientId ) ]->
+   [
+   RP_WaitingForToken_CA( clientId, skRP, nonce, code ),
+   Out( <'token_request_ca', code, clientId, 
+         jwt(<clientId, 'token_endpoint', nonce>, skRP)>
+   )
+   ]
+
+  /* has exactly the trivial AC variant */
+
+rule (modulo E) IdP_Issue_Token:
+   [
+   In( <'token_request_ca', code, clientId, clientAssertion> ),
+   IdP_CodeIssued_CA( code, clientId, userId, nonce, pkRP ),
+   !IdP_PrivKey_CA( skIdP )
+   ]
+  --[
+  Eq( checkjwt(clientAssertion, pkRP), <clientId, 'token_endpoint', nonce>
+  ),
+  IdP_Authenticated_RP( clientId, nonce ),
+  IdP_Issued_Token_CA( userId, clientId, nonce ),
+  Secret_CA( jwt(<userId, clientId, nonce>, skIdP) )
+  ]->
+   [ Out( <'token_response_ca', jwt(<userId, clientId, nonce>, skIdP)> ) ]
+
+  /*
+  rule (modulo AC) IdP_Issue_Token:
+     [
+     In( <'token_request_ca', code, clientId, clientAssertion> ),
+     IdP_CodeIssued_CA( code, clientId, userId, nonce, pkRP ),
+     !IdP_PrivKey_CA( skIdP )
+     ]
+    --[
+    Eq( z, <clientId, 'token_endpoint', nonce> ),
+    IdP_Authenticated_RP( clientId, nonce ),
+    IdP_Issued_Token_CA( userId, clientId, nonce ),
+    Secret_CA( jwt(<userId, clientId, nonce>, skIdP) )
+    ]->
+     [ Out( <'token_response_ca', jwt(<userId, clientId, nonce>, skIdP)> ) ]
+    variants (modulo AC)
+    1. clientAssertion
+             = clientAssertion.16
+       pkRP  = pkRP.20
+       z     = checkjwt(clientAssertion.16, pkRP.20)
+    
+    2. clientAssertion
+             = jwt(z.17, x.23)
+       pkRP  = pk(x.23)
+       z     = z.17
+  */
+
+rule (modulo E) RP_Verify_Token:
+   [
+   RP_WaitingForToken_CA( clientId, skRP, nonce, code ),
+   In( <'token_response_ca', idToken> ), !IdP_PubKey_CA( pkIdP )
+   ]
+  --[
+  Eq( checkjwt(idToken, pkIdP), <userId, clientId, nonce> ),
+  RP_Authenticated_CA( userId, clientId, nonce ),
+  Commit_CA( clientId, userId, <clientId, nonce> )
+  ]->
+   [ RP_Session_CA( clientId, userId ) ]
+
+  /*
+  rule (modulo AC) RP_Verify_Token:
+     [
+     RP_WaitingForToken_CA( clientId, skRP, nonce, code ),
+     In( <'token_response_ca', idToken> ), !IdP_PubKey_CA( pkIdP )
+     ]
+    --[
+    Eq( z, <userId, clientId, nonce> ),
+    RP_Authenticated_CA( userId, clientId, nonce ),
+    Commit_CA( clientId, userId, <clientId, nonce> )
+    ]->
+     [ RP_Session_CA( clientId, userId ) ]
+    variants (modulo AC)
+    1. idToken
+             = idToken.11
+       pkIdP = pkIdP.13
+       z     = checkjwt(idToken.11, pkIdP.13)
+    
+    2. idToken
+             = jwt(z.12, x.14)
+       pkIdP = pk(x.14)
+       z     = z.12
+  */
+
+restriction Equality:
+  "∀ x y #i. (Eq( x, y ) @ #i) ⇒ (x = y)"
+  // safety formula
+
+lemma ca_executable:
+  exists-trace
+  "∃ userId clientId nonce #i.
+    RP_Authenticated_CA( userId, clientId, nonce ) @ #i"
+/*
+guarded formula characterizing all satisfying traces:
+"∃ userId clientId nonce #i.
+  (RP_Authenticated_CA( userId, clientId, nonce ) @ #i)"
+*/
+simplify
+solve( RP_WaitingForToken_CA( clientId, skRP, nonce, code ) ▶₀ #i )
+  case RP_Request_Token
+  solve( !IdP_PubKey_CA( pk(x) ) ▶₂ #i )
+    case Setup_IdP
+    solve( !KU( jwt(<userId, ~clientId, ~nonce>, ~skIdP) ) @ #vk.2 )
+      case IdP_Issue_Token
+      solve( !KU( ~state ) @ #vk.7 )
+        case RP_Send_AuthRequest
+        solve( !KU( ~code.1 ) @ #vk.11 )
+          case IdP_Issue_Code
+          solve( !KU( ~clientId ) @ #vk.13 )
+            case RP_Request_Token_case_1
+            solve( !KU( ~nonce ) @ #vk.21 )
+              case RP_Request_Token
+              solve( !KU( ~state.2 ) @ #vk.24 )
+                case RP_Send_AuthRequest
+                solve( !KU( jwt(<~clientId, 'token_endpoint', ~nonce>, ~skRP)
+                       ) @ #vk.20 )
+                  case RP_Request_Token
+                  solve( !KU( pk(~skRP) ) @ #vk.25 )
+                    case Setup_RP
+                    SOLVED // trace found
+                  qed
+                qed
+              qed
+            qed
+          qed
+        qed
+      qed
+    qed
+  qed
+qed
+
+lemma ca_token_secrecy:
+  all-traces
+  "∀ token #i. (Secret_CA( token ) @ #i) ⇒ (¬(∃ #j. K( token ) @ #j))"
+/*
+guarded formula characterizing all counter-examples:
+"∃ token #i. (Secret_CA( token ) @ #i) ∧ ∃ #j. (K( token ) @ #j)"
+*/
+simplify
+solve( IdP_CodeIssued_CA( code, clientId, userId, nonce, pk(x) ) ▶₁ #i )
+  case IdP_Issue_Code
+  solve( !IdP_PrivKey_CA( skIdP ) ▶₂ #i )
+    case Setup_IdP
+    solve( !KU( jwt(<~clientId, 'token_endpoint', nonce>, ~skRP) ) @ #vk.8 )
+      case RP_Request_Token
+      solve( !KU( ~clientId ) @ #vk.6 )
+        case RP_Request_Token_case_1
+        solve( !KU( ~code ) @ #vk.6 )
+          case IdP_Issue_Code
+          solve( !KU( ~state.1 ) @ #vk.19 )
+            case RP_Send_AuthRequest
+            solve( !KU( ~nonce ) @ #vk.14 )
+              case RP_Request_Token
+              solve( !KU( ~state.2 ) @ #vk.22 )
+                case RP_Send_AuthRequest
+                solve( !KU( jwt(<~userId, ~clientId, ~nonce>, ~skIdP) ) @ #vk.15 )
+                  case IdP_Issue_Token
+                  solve( !KU( ~code.3 ) @ #vk.29 )
+                    case IdP_Issue_Code
+                    solve( !KU( pk(~skRP) ) @ #vk.29 )
+                      case Setup_RP
+                      SOLVED // trace found
+                    qed
+                  qed
+                qed
+              qed
+            qed
+          qed
+        qed
+      qed
+    qed
+  qed
+qed
+
+lemma ca_rp_authentication:
+  all-traces
+  "∀ userId clientId nonce #i.
+    (RP_Authenticated_CA( userId, clientId, nonce ) @ #i) ⇒
+    (∃ code #j.
+      (IdP_Issued_Code_CA( code, clientId, userId, nonce ) @ #j) ∧ (#j < #i))"
+/*
+guarded formula characterizing all counter-examples:
+"∃ userId clientId nonce #i.
+  (RP_Authenticated_CA( userId, clientId, nonce ) @ #i)
+ ∧
+  ∀ code #j.
+   (IdP_Issued_Code_CA( code, clientId, userId, nonce ) @ #j) ⇒ ¬(#j < #i)"
+*/
+simplify
+solve( RP_WaitingForToken_CA( clientId, skRP, nonce, code ) ▶₀ #i )
+  case RP_Request_Token
+  solve( !IdP_PubKey_CA( pk(x) ) ▶₂ #i )
+    case Setup_IdP
+    solve( !KU( jwt(<userId, ~clientId, ~nonce>, ~skIdP) ) @ #vk.2 )
+      case IdP_Issue_Token
+      by contradiction /* from formulas */
+    next
+      case c_jwt
+      by solve( !KU( ~skIdP ) @ #vk.9 )
+    qed
+  qed
+qed
+
+lemma ca_injective_agreement:
+  all-traces
+  "∀ clientId userId data #i #j.
+    ((Commit_CA( clientId, userId, data ) @ #i) ∧
+     (Commit_CA( clientId, userId, data ) @ #j)) ⇒
+    (#i = #j)"
+/*
+guarded formula characterizing all counter-examples:
+"∃ clientId userId data #i #j.
+  (Commit_CA( clientId, userId, data ) @ #i) ∧
+  (Commit_CA( clientId, userId, data ) @ #j)
+ ∧
+  ¬(#i = #j)"
+*/
+simplify
+solve( (#i < #j)  ∥ (#j < #i) )
+  case case_1
+  solve( RP_WaitingForToken_CA( clientId, skRP, nonce, code ) ▶₀ #i )
+    case RP_Request_Token
+    solve( !IdP_PubKey_CA( pk(x) ) ▶₂ #i )
+      case Setup_IdP
+      solve( RP_WaitingForToken_CA( ~clientId, skRP.1, ~nonce, code.1 ) ▶₀ #j )
+        case RP_Request_Token
+        by contradiction /* cyclic */
+      qed
+    qed
+  qed
+next
+  case case_2
+  solve( RP_WaitingForToken_CA( clientId, skRP, nonce, code ) ▶₀ #i )
+    case RP_Request_Token
+    solve( !IdP_PubKey_CA( pk(x) ) ▶₂ #i )
+      case Setup_IdP
+      solve( RP_WaitingForToken_CA( ~clientId, skRP.1, ~nonce, code.1 ) ▶₀ #j )
+        case RP_Request_Token
+        by contradiction /* cyclic */
+      qed
+    qed
+  qed
+qed
+
+lemma idp_authenticates_rp:
+  all-traces
+  "∀ userId clientId nonce #i.
+    (IdP_Issued_Token_CA( userId, clientId, nonce ) @ #i) ⇒
+    (∃ #j. (IdP_Authenticated_RP( clientId, nonce ) @ #j) ∧ (#j = #i))"
+/*
+guarded formula characterizing all counter-examples:
+"∃ userId clientId nonce #i.
+  (IdP_Issued_Token_CA( userId, clientId, nonce ) @ #i)
+ ∧
+  ∀ #j. (IdP_Authenticated_RP( clientId, nonce ) @ #j) ∧ (#j = #i) ⇒ ⊥"
+*/
+simplify
+by contradiction /* from formulas */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/*
+WARNING: the following wellformedness checks failed!
+
+Unbound variables
+=================
+
+  rule `RP_Verify_Token' has unbound variables: 
+    userId
+
+Message Derivation Checks
+=========================
+
+  The variables of the follwing rule(s) are not derivable from their premises, you may be performing unintended pattern matching.
+
+Rule RP_Verify_Token: 
+Failed to derive Variable(s): userId
+*/
+
+/*
+Generated from:
+Tamarin version 1.8.0
+Maude version 3.2 (unsuported)
+Git revision: f172d7f00b1485446a1e7a42dc14623c2189cc42, branch: master
+Compiled at: 2023-09-01 08:49:23.916032222 UTC
+*/
+
+end
+
+==============================================================================
+summary of summaries:
+
+analyzed: 03_code_flow_client_auth.spthy
+
+  processing time: 3.41s
+  
+  WARNING: 2 wellformedness check failed!
+           The analysis results might be wrong!
+  
+  ca_executable (exists-trace): verified (12 steps)
+  ca_token_secrecy (all-traces): falsified - found trace (13 steps)
+  ca_rp_authentication (all-traces): verified (6 steps)
+  ca_injective_agreement (all-traces): verified (10 steps)
+  idp_authenticates_rp (all-traces): verified (2 steps)
+
+==============================================================================
